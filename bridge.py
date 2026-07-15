@@ -22,10 +22,13 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +43,8 @@ PID_FILE = LOG_DIR / "bridge.pid"
 # 비-BMP 이모지 다량 시 초과 방지용 안전마진으로 4000 으로 낮춘다(완전 UTF-16 분할은 과함).
 TELEGRAM_LIMIT = 4000
 POLL_TIMEOUT = 25  # 텔레그램 롱폴링 대기(초)
+PROGRESS_THROTTLE_SEC = 2.5  # editMessageText 최소 간격(텔레그램 rate-limit 보호)
+PROGRESS_TAIL_LINES = 12  # 진행 메시지에 표시할 최근 이벤트 줄 수(도배·4096 방지)
 COMMANDS = frozenset({"/help", "/start", "/projects", "/cancel", "push"})
 
 # claude 헤드리스가 대상 폴더 상위의 루트 헌법(CLAUDE.md)을 로드하면 "세션 시작=신원 확인"
@@ -53,7 +58,7 @@ BRIDGE_SYSTEM_PROMPT = (
     "작업을 마치면 변경사항을 Conventional Commit 메시지로 로컬 커밋하라. "
     "절대 push 하지 마라(push 는 관리자가 텔레그램에서 'push' 라고 답장해 승인한다). "
     "보호 대상(_Template/Dev, 루트 CLAUDE.md, 모델 설정)은 변경하지 마라. "
-    "결과는 무엇을 했는지 1~3줄로 간결히 보고하라."
+    "결과는 무엇을 했는지 1~3줄로 간결히, 반드시 정중한 존댓말('~했습니다', '~됩니다')로 보고하라."
 )
 
 # claude CLI 허용 도구 화이트리스트(= 안전 경계). 일반 Bash·git push·네트워크 미포함.
@@ -128,6 +133,92 @@ def mask_secrets(text: str, secrets: list[str]) -> str:
         if s:
             text = text.replace(s, "***")
     return text
+
+
+def event_to_progress(event: dict[str, Any], secrets: list[str] | None = None) -> str | None:
+    """stream-json NDJSON 이벤트 1개 → 진행 표시 한 줄. 표시 불필요하면 None.
+
+    assistant 의 text(내레이션)·tool_use(도구 동작)만 렌더하고,
+    thinking·tool_result·system init·rate_limit·result 등은 None(큐레이션).
+    파일명은 basename 만 노출(경로 축소), Bash 명령은 앞 60자. 순수 함수(테스트 대상).
+    비밀값은 **잘라내기 전에** 마스킹한다(L-1: 경계에서 쪼개진 조각 노출 방지).
+    """
+    sec = secrets or []
+    if event.get("type") != "assistant":
+        return None
+    msg = event.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return None
+    # 스트림은 블록 1개/이벤트를 방출(실측) — 첫 렌더 가능한 블록만 취한다.
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = str(block.get("text", "")).strip()
+            if text:
+                return mask_secrets(text, sec)[:120]
+        elif btype == "tool_use":
+            name = block.get("name")
+            inp = block.get("input")
+            args = inp if isinstance(inp, dict) else {}
+            if name == "Read":
+                return f"📖 읽음: {Path(str(args.get('file_path') or '?')).name}"
+            if name in ("Edit", "Write"):
+                return f"✏️ 수정: {Path(str(args.get('file_path') or '?')).name}"
+            if name == "Bash":
+                cmd = mask_secrets(str(args.get("command") or "").strip(), sec)
+                return f"⚡ 실행: {cmd[:60]}"
+            if isinstance(name, str) and name:
+                return f"🔧 {name}"
+    return None
+
+
+def project_keyboard(names: list[str]) -> dict[str, Any]:
+    """프로젝트명 리스트 → 텔레그램 inline_keyboard(dict). 한 줄 2개씩.
+
+    callback_data 는 `p:<name>` 접두(라우팅 화이트리스트). 텔레그램 한도 64바이트를
+    넘는 이름은 data 만 잘라내되(부분 멀티바이트는 ignore 로 절단) 표시 text 는 전체.
+    빈 리스트면 버튼 없는 구조({"inline_keyboard": []}). 순수 함수(테스트 대상).
+    """
+    buttons: list[dict[str, str]] = []
+    for name in names:
+        data = ("p:" + name).encode("utf-8")[:64].decode("utf-8", "ignore")
+        buttons.append({"text": name, "callback_data": data})
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return {"inline_keyboard": rows}
+
+
+def push_keyboard() -> dict[str, Any]:
+    """[✅ Push] [❌ 취소] 한 행. callback_data 는 화이트리스트 토큰(push·x)."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Push", "callback_data": "push"},
+                {"text": "❌ 취소", "callback_data": "x"},
+            ]
+        ]
+    }
+
+
+def parse_callback(data: str) -> tuple[str, str] | None:
+    """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
+
+    `push`/`x` → (그대로, ""), `p:<name>` → ("p", name). 임의 실행 없이 정확 매칭만.
+    """
+    if data in ("push", "x"):
+        return (data, "")
+    if data.startswith("p:") and len(data) > 2:
+        return ("p", data[2:])
+    return None
+
+
+def project_guide(name: str) -> str:
+    """프로젝트 버튼 탭 시 안내 문구(상태 저장 없음 — 이어서 보내라는 안내만)."""
+    return f"{name} 프로젝트 — 작업 지시를 이어서 보내세요. 예) {name} README 고쳐줘"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -243,13 +334,23 @@ def get_updates(token: str, offset: int) -> dict[str, Any]:
     )
 
 
-def send_message(token: str, chat_id: int, text: str, secrets: list[str]) -> None:
-    """마스킹 후 TELEGRAM_LIMIT 청크로 분할 전송."""
+def send_message(
+    token: str,
+    chat_id: int,
+    text: str,
+    secrets: list[str],
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
+    """마스킹 후 TELEGRAM_LIMIT 청크로 분할 전송. reply_markup 은 마지막 청크에만 첨부."""
     safe = mask_secrets(text, secrets)
-    for chunk in chunk_text(safe, TELEGRAM_LIMIT):
+    chunks = chunk_text(safe, TELEGRAM_LIMIT)
+    for i, chunk in enumerate(chunks):
         body = chunk if chunk else "(빈 응답)"
+        params: dict[str, Any] = {"chat_id": chat_id, "text": body}
+        if reply_markup is not None and i == len(chunks) - 1:
+            params["reply_markup"] = json.dumps(reply_markup)
         try:
-            tg_call(token, "sendMessage", {"chat_id": chat_id, "text": body}, timeout=30)
+            tg_call(token, "sendMessage", params, timeout=30)
         except (
             urllib.error.URLError,
             OSError,
@@ -257,6 +358,63 @@ def send_message(token: str, chat_id: int, text: str, secrets: list[str]) -> Non
             http.client.HTTPException,
         ) as e:
             log.warning("sendMessage 실패: %s", type(e).__name__)
+
+
+def answer_callback(token: str, callback_query_id: str) -> None:
+    """answerCallbackQuery — 버튼 탭 시 로딩 스피너 종료. 실패는 로그만(작업 안 죽게)."""
+    try:
+        tg_call(
+            token,
+            "answerCallbackQuery",
+            {"callback_query_id": callback_query_id},
+            timeout=30,
+        )
+    except (
+        urllib.error.URLError,
+        OSError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+    ) as e:
+        log.warning("answerCallbackQuery 실패: %s", type(e).__name__)
+
+
+def send_message_get_id(token: str, chat_id: int, text: str, secrets: list[str]) -> int | None:
+    """진행 메시지 1건 전송 후 message_id 반환(실패 시 None). 짧은 단문 가정 — 분할 없음."""
+    safe = mask_secrets(text, secrets)
+    body = safe[:TELEGRAM_LIMIT] if safe else "(빈 응답)"
+    try:
+        resp = tg_call(token, "sendMessage", {"chat_id": chat_id, "text": body}, timeout=30)
+    except (
+        urllib.error.URLError,
+        OSError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+    ) as e:
+        log.warning("sendMessage(progress) 실패: %s", type(e).__name__)
+        return None
+    result = resp.get("result")
+    mid = result.get("message_id") if isinstance(result, dict) else None
+    return mid if isinstance(mid, int) else None
+
+
+def edit_message(token: str, chat_id: int, message_id: int, text: str, secrets: list[str]) -> None:
+    """진행 메시지 in-place 갱신. rate-limit(429) 등 실패는 로그만·계속(작업 안 죽게)."""
+    safe = mask_secrets(text, secrets)
+    body = safe[:TELEGRAM_LIMIT] if safe else "(빈 응답)"
+    try:
+        tg_call(
+            token,
+            "editMessageText",
+            {"chat_id": chat_id, "message_id": message_id, "text": body},
+            timeout=30,
+        )
+    except (
+        urllib.error.URLError,
+        OSError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+    ) as e:
+        log.warning("editMessageText 실패: %s", type(e).__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -275,8 +433,25 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
-def run_claude(claude_exe: str, project_path: str, task: str, timeout: int) -> dict[str, Any]:
-    """claude -p headless 실행 후 JSON 결과 파싱. 실패는 is_error 구조로 정규화.
+def run_claude(
+    claude_exe: str,
+    project_path: str,
+    task: str,
+    timeout: int,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """claude -p 를 stream-json 으로 실행, NDJSON 이벤트를 증분 소비한다.
+
+    on_event: 파싱된 이벤트 dict 마다 호출(진행 표시용). 최종 `result` 이벤트를 그대로
+    반환(format_reply 호환: `.result`·`.is_error`·`.total_cost_usd`). result 없이 끝나면
+    is_error 폴백. 스트림이라 communicate(timeout=) 을 못 쓰므로 리더 데몬 스레드 +
+    메인 deadline join 패턴을 쓴다(초과 시 `_kill_tree` 로 트리 정리).
+
+    스트림 리더는 (D2) `result` 이벤트 저장 직후 break 한다 — MCP 손자 프로세스가 상속한
+    stdout write 핸들을 붙잡아 EOF 가 안 와도 데드라인까지 대기하지 않는다(오타임아웃 방지).
+    stderr 는 (D1) 별도 드레인 스레드가 실시간 배수해 파이프 버퍼 포화로 인한 자식 블록을
+    막고, 마지막 N줄만 폴백 진단용으로 보관한다. 리더 종료 후엔 (D3) `_kill_tree` 로
+    손자(MCP)까지 정리한 뒤 reap 한다.
 
     보안(C-1): 사용자 task 는 argv 에 두지 않고 **stdin 으로만** 전달한다. Windows 에서
     `shutil.which("claude")` 는 배치 shim(claude.CMD)으로 해석돼 argv 가 cmd.exe 재파싱을
@@ -287,7 +462,8 @@ def run_claude(claude_exe: str, project_path: str, task: str, timeout: int) -> d
         claude_exe,
         "-p",
         "--output-format",
-        "json",
+        "stream-json",  # 증분 이벤트(NDJSON) — -p 에서 --verbose 필수
+        "--verbose",
         "--model",
         "opus",
         "--permission-mode",
@@ -314,29 +490,80 @@ def run_claude(claude_exe: str, project_path: str, task: str, timeout: int) -> d
     except OSError as e:
         return {"is_error": True, "result": f"claude 실행 불가: {type(e).__name__}"}
 
-    try:
-        out, err = proc.communicate(input=task, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    result_box: dict[str, Any] = {}
+    err_tail: deque[str] = deque(maxlen=40)  # D1: stderr 마지막 N줄만(폴백 진단용)
+
+    def reader() -> None:
+        stdin = proc.stdin
+        stdout = proc.stdout
+        if stdin is None or stdout is None:
+            return
+        # task 는 stdin 전용(C-1). write 후 close 해 claude 가 입력 종료를 인지하게 한다.
+        with contextlib.suppress(OSError):
+            stdin.write(task)
+            stdin.close()
+        for raw in stdout:  # NDJSON 한 줄 = 한 이벤트, 증분 소비
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # 깨진 줄은 skip·계속(브리지·작업 안 죽게)
+            if not isinstance(event, dict):
+                continue
+            if on_event is not None:
+                try:
+                    on_event(event)
+                except Exception as e:  # 진행표시 오류가 스트림 리더를 죽이지 않게(타입만)
+                    log.warning("on_event 실패: %s", type(e).__name__)
+            if event.get("type") == "result":
+                # D2: result 저장 직후 break — 스트림상 result 뒤엔 유의미 이벤트가 없다.
+                # MCP 손자가 stdout write fd 를 붙잡아 EOF 가 안 와도 데드라인까지
+                # 대기하지 않게 여기서 끊는다(오타임아웃 방지).
+                result_box["data"] = event
+                break
+
+    def drain() -> None:
+        # D1: 실행 중 stderr 를 배수하지 않으면 파이프 버퍼 포화 → 자식 블록 → 거짓 타임아웃.
+        # 드레인 스레드가 stderr 를 소유하고 마지막 N줄만 보관한다(폴백 시 진단 텍스트).
+        stderr = proc.stderr
+        if stderr is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            for raw in stderr:
+                err_tail.append(raw.rstrip())
+
+    t = threading.Thread(target=reader, daemon=True)
+    te = threading.Thread(target=drain, daemon=True)
+    t.start()
+    te.start()
+    t.join(timeout)
+    if t.is_alive():
+        # 전체 데드라인 초과 — 트리 정리 후 중단(D1: taskkill /T → kill).
         _kill_tree(proc)
-        # D1: 손자가 파이프를 물고 있으면 무한정 communicate() 가 hang 하므로 짧은 타임아웃 부여.
-        try:
-            proc.communicate(timeout=10)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            log.warning("kill 후 파이프 정리 실패(%s) — 무시하고 진행", type(e).__name__)
+        t.join(5)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.wait(timeout=10)
+        # D2 방어(두 겹): 타임아웃이라도 이미 result 를 캡처했으면 살려서 반환(오타임아웃 방지).
+        data = result_box.get("data")
+        if isinstance(data, dict):
+            return data
         return {"is_error": True, "result": f"타임아웃({timeout}s) 초과 — 작업을 중단했습니다."}
 
-    if not out.strip():
-        detail = err.strip()[:500] or f"rc={proc.returncode}"
-        return {"is_error": True, "result": f"claude 응답 없음. {detail}"}
-    try:
-        parsed = json.loads(out)
-    except json.JSONDecodeError:
-        return {"is_error": True, "result": out.strip()[:1000]}
-    # JSON 이 dict 가 아니면(list/스칼라) format_reply 가 .get 에서 죽으므로 정규화.
-    if not isinstance(parsed, dict):
-        return {"is_error": True, "result": out.strip()[:1000]}
-    data: dict[str, Any] = parsed
-    return data
+    # 리더가 result break 또는 stdout EOF 로 종료 — D2/D3: 손자(MCP) 트리를 정리 후 reap.
+    # (result 뒤엔 세션 끝이라 kill 안전; 이미 죽었으면 무해.)
+    _kill_tree(proc)
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=10)
+
+    data = result_box.get("data")
+    if isinstance(data, dict):
+        return data
+    # result 이벤트 없이 끝남(크래시·기동 실패 등) — stderr 드레인 버퍼로 폴백.
+    te.join(2)  # 드레인이 마지막 줄까지 배수하도록 잠깐 대기(deque 동시변경 회피 겸).
+    err = "\n".join(err_tail).strip()[-500:]
+    return {"is_error": True, "result": err or f"claude 응답 없음(rc={proc.returncode})"}
 
 
 # 회신 헤더(처리 성공은 전부 동일, 실패만 구분). 확인 사항은 하위 섹션.
@@ -367,17 +594,22 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def git_ahead(root: Path) -> int:
+    """origin/main 보다 앞선 로컬 커밋 수. git 실패는 0 안전 폴백(브리지 안 죽게)."""
+    try:
+        r = _git(root, "rev-list", "--count", "origin/main..HEAD")
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+    except (OSError, ValueError):
+        return 0
+
+
 def git_status_note(root: Path) -> str:
     """run_claude 성공 후 실제 git 상태로 커밋/푸시 안내 문구 생성.
 
     ahead = origin/main 보다 앞선 로컬 커밋 수, dirty = 미커밋 변경 유무.
     git 실패는 안전 폴백(각 0/없음)으로 처리해 브리지가 죽지 않게 한다.
     """
-    try:
-        r = _git(root, "rev-list", "--count", "origin/main..HEAD")
-        ahead = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
-    except (OSError, ValueError):
-        ahead = 0
+    ahead = git_ahead(root)
     try:
         s = _git(root, "status", "--porcelain")
         dirty = bool(s.stdout.strip()) if s.returncode == 0 else False
@@ -421,6 +653,66 @@ HELP_TEXT = (
 )
 
 
+def handle_callback(
+    cq: dict[str, Any],
+    token: str,
+    allowed: frozenset[int],
+    repo_root: Path,
+    target_root: str,
+    secrets: list[str],
+) -> None:
+    """인라인 버튼 탭(callback_query) 처리. 화이트리스트 라우팅·상태 저장 없음.
+
+    보안: chat ID 허용목록 게이트를 answerCallbackQuery·라우팅보다 **먼저** 통과시킨다.
+    callback_data 는 신뢰 경계 밖이라 parse_callback 의 정확 매칭만 분기(임의 실행 금지),
+    `p:` 인자는 resolve_project 로 재검증한다.
+    """
+    frm = cq.get("from")
+    from_id = frm.get("id") if isinstance(frm, dict) else None
+    message = cq.get("message")
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else from_id
+    # ── 허용목록 게이트(필수, 최우선) ──
+    if not isinstance(chat_id, int) or not is_allowed(chat_id, allowed):
+        log.warning("미허용 callback chat_id=%s 무시", chat_id)
+        return
+
+    cq_id = cq.get("id")
+    if isinstance(cq_id, str):
+        answer_callback(token, cq_id)  # 로딩 스피너 종료
+
+    data = cq.get("data")
+    parsed = parse_callback(data) if isinstance(data, str) else None
+    if parsed is None:
+        return  # 알 수 없는 callback_data 는 무시
+    action, arg = parsed
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+
+    if action == "p":
+        # 상태 저장 없이 안내만 — resolve_project 로 유효성 재확인, 무효면 무시.
+        if resolve_project(arg, target_root) is None:
+            log.warning("미확인 프로젝트 callback=%r 무시", arg)
+            return
+        log.info("chat=%s callback project=%s", chat_id, arg)
+        send_message(token, chat_id, project_guide(arg), secrets)
+    elif action == "push":
+        log.info("chat=%s callback push", chat_id)
+        result = do_push(repo_root)
+        # 결과로 원본 메시지를 교체 편집 = 버튼 제거 겸용(실패 시 새 메시지).
+        if isinstance(message_id, int):
+            edit_message(token, chat_id, message_id, result, secrets)
+        else:
+            send_message(token, chat_id, result, secrets)
+        outcome = "완료" if result.startswith(HEADER_DONE) else "실패"
+        log.info("chat=%s callback push 결과=%s", chat_id, outcome)
+    elif action == "x":
+        log.info("chat=%s callback 취소", chat_id)
+        if isinstance(message_id, int):
+            edit_message(token, chat_id, message_id, "취소했습니다.", secrets)
+        else:
+            send_message(token, chat_id, "취소했습니다.", secrets)
+
+
 def handle_update(
     upd: dict[str, Any],
     token: str,
@@ -431,6 +723,11 @@ def handle_update(
     timeout: int,
     secrets: list[str],
 ) -> None:
+    # 인라인 버튼 탭은 callback_query 로 온다 — 허용목록 게이트를 handle_callback 안에서 검증.
+    cq = upd.get("callback_query")
+    if isinstance(cq, dict):
+        handle_callback(cq, token, allowed, repo_root, target_root, secrets)
+        return
     # D6: edited_message 는 무시한다 — 원격 코드실행 브리지라, 이미 처리한 메시지를 편집하면
     # claude 작업이 재실행되는 것을 막기 위해 신규 message 만 트리거로 삼는다.
     msg = upd.get("message")
@@ -458,7 +755,7 @@ def handle_update(
         names = list_projects(target_root)
         body = "대상 프로젝트\n" + ("\n".join(f"• {n}" for n in names) or "(없음)")
         log.info("chat=%s cmd=/projects count=%d", chat_id, len(names))
-        send_message(token, chat_id, body, secrets)
+        send_message(token, chat_id, body, secrets, project_keyboard(names))
         return
     if stripped == "/cancel":
         send_message(token, chat_id, "직렬 처리라 취소할 대기 작업이 없습니다.", secrets)
@@ -473,7 +770,9 @@ def handle_update(
 
     parsed = parse_message(text)
     if parsed is None:
-        send_message(token, chat_id, f"형식을 이해하지 못했습니다.\n\n{HELP_TEXT}", secrets)
+        names = list_projects(target_root)
+        body = f"형식을 이해하지 못했습니다.\n\n{HELP_TEXT}"
+        send_message(token, chat_id, body, secrets, project_keyboard(names))
         return
     project, task = parsed
     proj_path = resolve_project(project, target_root)
@@ -482,19 +781,49 @@ def handle_update(
         body = f"'{project}' 프로젝트를 찾지 못했습니다.\n대상: " + (", ".join(names) or "(없음)")
         # 보안: 사용자 입력 project 를 %r 로 로깅해 개행 위조(로그 포깅)를 차단.
         log.warning("chat=%s 알수없는 프로젝트=%r", chat_id, project)
-        send_message(token, chat_id, body, secrets)
+        send_message(token, chat_id, body, secrets, project_keyboard(names))
         return
 
     log.info("chat=%s 실행 project=%s", chat_id, project)
-    send_message(token, chat_id, f"[{project}] 작업 시작… 완료까지 대기하세요.", secrets)
-    data = run_claude(claude_exe, proj_path, task, timeout)
+    # 진행 메시지 1개 전송 → message_id 확보(이후 editMessageText 로 실시간 갱신).
+    header = f"🔄 [{project}] 작업 중…"
+    message_id = send_message_get_id(token, chat_id, header, secrets)
+    progress: list[str] = []
+    last_edit = 0.0
+
+    def on_event(event: dict[str, Any]) -> None:
+        nonlocal last_edit
+        line = event_to_progress(event, secrets)
+        if line is None:
+            return
+        progress.append(line)
+        now = time.monotonic()
+        # throttle: 마지막 편집으로부터 PROGRESS_THROTTLE_SEC 경과 시에만 갱신(rate-limit 보호).
+        # 그 사이 이벤트는 버퍼링됐다 다음 편집 때 최근 N줄로 반영된다.
+        if message_id is not None and now - last_edit >= PROGRESS_THROTTLE_SEC:
+            last_edit = now
+            body = header + "\n\n" + "\n".join(progress[-PROGRESS_TAIL_LINES:])
+            edit_message(token, chat_id, message_id, body, secrets)
+
+    data = run_claude(claude_exe, proj_path, task, timeout, on_event)
     reply = format_reply(data)
+    # 완료: 진행 메시지를 최종 결과로 교체 편집. 4096 초과분은 후속 메시지로.
+    # (경계에서 비밀값이 쪼개지지 않게 마스킹 후 분할 — send_message 와 동일 규약)
+    chunks = chunk_text(mask_secrets(reply, secrets), TELEGRAM_LIMIT)
+    if message_id is not None:
+        edit_message(token, chat_id, message_id, chunks[0], secrets)
+        for extra in chunks[1:]:
+            send_message(token, chat_id, extra, secrets)
+    else:
+        send_message(token, chat_id, reply, secrets)
+    # git 상태 안내는 별도 메시지(4096·명확성). 로컬 커밋 대기(ahead>0)면 push 버튼 첨부.
     if not data.get("is_error"):
         try:
-            reply += f"\n\n\n{HEADER_NOTE}\n\n{git_status_note(repo_root)}"
+            note = git_status_note(repo_root)
+            markup = push_keyboard() if git_ahead(repo_root) > 0 else None
+            send_message(token, chat_id, f"{HEADER_NOTE}\n\n{note}", secrets, markup)
         except Exception as e:  # git 조회 실패로 회신이 막히지 않게(타입만 기록)
             log.warning("git_status_note 실패: %s", type(e).__name__)
-    send_message(token, chat_id, reply, secrets)
     outcome = "error" if data.get("is_error") else "ok"
     log.info("chat=%s 완료 project=%s 결과=%s", chat_id, project, outcome)
 
@@ -611,6 +940,28 @@ def _selftest() -> None:
     assert chunk_text("") == [""]
     assert chunk_text("abcd", 2) == ["ab", "cd"]
     assert mask_secrets("tok=SECRET here", ["SECRET"]) == "tok=*** here"
+    _tool = {"type": "tool_use", "name": "Read", "input": {"file_path": "a/b/x.py"}}
+    _read = {"type": "assistant", "message": {"content": [_tool]}}
+    assert event_to_progress(_read) == "📖 읽음: x.py"
+    _txt = {"type": "assistant", "message": {"content": [{"type": "text", "text": "확인합니다"}]}}
+    assert event_to_progress(_txt) == "확인합니다"
+    assert event_to_progress({"type": "system", "subtype": "init"}) is None
+    assert event_to_progress({"type": "result", "result": "x"}) is None
+    assert project_keyboard([]) == {"inline_keyboard": []}
+    _kb = project_keyboard(["a", "b", "c"])
+    assert len(_kb["inline_keyboard"]) == 2  # 2개씩 → [a,b][c]
+    assert _kb["inline_keyboard"][0][0]["callback_data"] == "p:a"
+    assert all(
+        len(btn["callback_data"].encode("utf-8")) <= 64
+        for row in project_keyboard(["x" * 100])["inline_keyboard"]
+        for btn in row
+    )
+    assert push_keyboard()["inline_keyboard"][0][0]["callback_data"] == "push"
+    assert parse_callback("push") == ("push", "")
+    assert parse_callback("x") == ("x", "")
+    assert parse_callback("p:etf_info") == ("p", "etf_info")
+    assert parse_callback("p:") is None
+    assert parse_callback("bogus") is None
     print("selftest ok")
 
 

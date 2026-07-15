@@ -3,9 +3,12 @@
 .env.*
 !.env.example
 
-# 런타임 상태
+# 런타임 상태 (오프셋·pidfile·알림상태·수신사진 포함)
 logs/
 !logs/.gitkeep
+
+# 알림 스케줄 — 개인 종목·체크 항목이므로 실제 파일은 커밋 금지 (예시만 커밋)
+schedules/notify.json
 
 # 파이썬
 __pycache__/

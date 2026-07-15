@@ -1,0 +1,32 @@
+{
+  "timezone": "Asia/Seoul",
+  "items": [
+    {
+      "id": "example-market-open",
+      "project": "example_project",
+      "days": ["mon", "tue", "wed", "thu", "fri"],
+      "at": "09:00",
+      "label": "장 개장 점검",
+      "note": "개장 직후 화면이 정상 상태로 전환되는지 example 확인",
+      "grace_min": 30
+    },
+    {
+      "id": "example-ticker-check",
+      "project": "example_project",
+      "days": ["mon", "tue", "wed", "thu", "fri"],
+      "at": "17:00",
+      "label": "예시 종목 등락률",
+      "note": "예시 종목의 등락률이 기준값과 일치하는지 확인",
+      "grace_min": 30
+    },
+    {
+      "id": "example-weekend",
+      "project": "example_project",
+      "days": ["sat"],
+      "at": "06:00",
+      "label": "주말 상태 점검",
+      "note": "주말 진입 시 인라인 표시가 example 규칙대로 바뀌는지 확인",
+      "grace_min": 30
+    }
+  ]
+}

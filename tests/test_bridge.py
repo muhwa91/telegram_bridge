@@ -15,23 +15,43 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import bridge
 import pytest
 from bridge import (
+    build_compare_prompt,
+    choice_keyboard,
     chunk_text,
+    download_file,
+    due_notifications,
+    due_snoozes,
     event_to_progress,
+    extract_photo,
+    fetch_stock,
     format_reply,
     handle_callback,
+    handle_photo,
+    handle_update,
     is_allowed,
+    load_notify_state,
+    load_schedules,
     mask_secrets,
+    notify_keyboard,
     parse_callback,
+    parse_caption_ticker,
+    parse_choice_prompt,
     parse_message,
+    parse_stock_response,
     project_keyboard,
     push_keyboard,
     resolve_project,
     run_claude,
+    save_notify_state,
+    stock_url,
+    valid_ticker,
 )
 
 
@@ -307,7 +327,7 @@ def test_event_to_progress_text_stripped():
 
 def test_event_to_progress_masks_secret_before_truncation():
     # L-1: 경계에서 비밀값이 쪼개져 조각이 새지 않도록, 잘라내기 전에 마스킹해야 한다.
-    secret = "C:\\Users\\Home"
+    secret = "C:\\Users\\Example"
     # secret 이 60자 경계에 걸치도록 배치(prefix 55 → secret 이 55~68 위치).
     # 마스킹을 안 하면 [:60] 이 "...C:\\Us" 같은 조각을 남긴다.
     cmd = "a" * 55 + secret + "tail"
@@ -779,3 +799,916 @@ def test_callback_unknown_data_ignored(cb_spy, tmp_path):
     assert cb_spy["edit"] == []
     assert cb_spy["push"] == []
     assert cb_spy["answer"] == ["cq1"]
+
+
+# ===========================================================================
+# ① 시각 알림 — load_schedules / due_notifications / due_snoozes / notify_keyboard
+#   parse_callback(nb) / notify_state 왕복. 전부 순수(파일은 tmp_path).
+# 계약: docs/features/remote-assistant/01-계획.md "① 시각 알림" 섹션.
+# ===========================================================================
+
+_KST = ZoneInfo("Asia/Seoul")
+# 2026-07-15 = 수요일.
+_WED_0910 = datetime(2026, 7, 15, 9, 10, tzinfo=_KST)
+_WED_0900 = datetime(2026, 7, 15, 9, 0, tzinfo=_KST)
+_WED_0931 = datetime(2026, 7, 15, 9, 31, tzinfo=_KST)
+
+
+def _item(**over):
+    base = {"id": "x", "days": ["wed"], "at": "09:00", "grace_min": 30, "label": "L", "note": "N"}
+    base.update(over)
+    return base
+
+
+def test_load_schedules_missing_file_empty(tmp_path):
+    assert load_schedules(tmp_path / "nope.json") == []
+
+
+def test_load_schedules_corrupt_empty(tmp_path):
+    p = tmp_path / "notify.json"
+    p.write_text("{ not json", encoding="utf-8")
+    assert load_schedules(p) == []
+
+
+def test_load_schedules_reads_items(tmp_path):
+    p = tmp_path / "notify.json"
+    p.write_text('{"items": [{"id": "a"}, "bad", {"id": "b"}]}', encoding="utf-8")
+    items = load_schedules(p)
+    assert [it["id"] for it in items] == ["a", "b"]  # dict 아닌 항목 제거
+
+
+def test_load_schedules_non_list_items_empty(tmp_path):
+    p = tmp_path / "notify.json"
+    p.write_text('{"items": "oops"}', encoding="utf-8")
+    assert load_schedules(p) == []
+
+
+def test_due_notifications_in_window():
+    assert due_notifications([_item()], _WED_0910, set()) == [_item()]
+
+
+def test_due_notifications_at_window_start_inclusive():
+    assert due_notifications([_item()], _WED_0900, set()) == [_item()]
+
+
+def test_due_notifications_at_window_end_inclusive():
+    # 09:00 + 30분 = 09:30 경계 포함, 09:31 은 밖.
+    end = datetime(2026, 7, 15, 9, 30, tzinfo=_KST)
+    assert due_notifications([_item()], end, set()) == [_item()]
+    assert due_notifications([_item()], _WED_0931, set()) == []
+
+
+def test_due_notifications_wrong_weekday_skipped():
+    assert due_notifications([_item(days=["mon"])], _WED_0910, set()) == []
+
+
+def test_due_notifications_dedup_by_fired():
+    assert due_notifications([_item()], _WED_0910, {("x", "2026-07-15")}) == []
+
+
+def test_due_notifications_before_window_skipped():
+    early = datetime(2026, 7, 15, 8, 59, tzinfo=_KST)
+    assert due_notifications([_item()], early, set()) == []
+
+
+def test_due_notifications_malformed_at_skipped():
+    assert due_notifications([_item(at="oops")], _WED_0910, set()) == []
+    assert due_notifications([_item(at="25:00")], _WED_0910, set()) == []
+
+
+def test_due_notifications_missing_grace_defaults_30():
+    it = {"id": "x", "days": ["wed"], "at": "09:00"}  # grace 없음
+    assert due_notifications([it], _WED_0910, set()) == [it]
+
+
+def test_due_snoozes_past_refire_returned():
+    past = datetime(2026, 7, 15, 9, 0, tzinfo=_KST).isoformat()
+    assert due_snoozes({"x": past}, _WED_0910) == ["x"]
+
+
+def test_due_snoozes_future_not_returned():
+    future = datetime(2026, 7, 15, 10, 0, tzinfo=_KST).isoformat()
+    assert due_snoozes({"x": future}, _WED_0910) == []
+
+
+def test_due_snoozes_corrupt_iso_skipped():
+    assert due_snoozes({"x": "not-a-date"}, _WED_0910) == []
+
+
+def test_notify_keyboard_callback_data():
+    kb = notify_keyboard("ti-kospi-open")
+    row = kb["inline_keyboard"][0]
+    assert [b["callback_data"] for b in row] == ["nb:ok:ti-kospi-open", "nb:later:ti-kospi-open"]
+
+
+def test_parse_callback_nb_ok():
+    assert parse_callback("nb:ok:ti-rollover") == ("nb:ok", "ti-rollover")
+
+
+def test_parse_callback_nb_later():
+    assert parse_callback("nb:later:ti-rollover") == ("nb:later", "ti-rollover")
+
+
+def test_parse_callback_nb_empty_id_rejected():
+    assert parse_callback("nb:ok:") is None
+    assert parse_callback("nb:later:") is None
+
+
+def test_parse_callback_nb_unsafe_id_rejected():
+    # charset 밖(경로·주입 방어) → None.
+    assert parse_callback("nb:ok:bad/id") is None
+    assert parse_callback("nb:ok:a b") is None
+    assert parse_callback("nb:ok:" + "z" * 65) is None
+
+
+def test_notify_state_roundtrip(tmp_path):
+    p = tmp_path / "notify_state.json"
+    fired = {("x", "2026-07-15"), ("y", "2026-07-15")}
+    snooze = {"z": "2026-07-15T09:00:00+09:00"}
+    save_notify_state(p, fired, snooze)
+    got_fired, got_snooze = load_notify_state(p, "2026-07-15")
+    assert got_fired == fired
+    assert got_snooze == snooze
+
+
+def test_notify_state_prunes_stale_date(tmp_path):
+    p = tmp_path / "notify_state.json"
+    save_notify_state(
+        p,
+        {("today", "2026-07-15"), ("old", "2026-07-14")},
+        {"fresh": "2026-07-15T09:00:00+09:00", "stale": "2026-07-14T09:00:00+09:00"},
+    )
+    fired, snooze = load_notify_state(p, "2026-07-15")
+    assert fired == {("today", "2026-07-15")}  # 지난 날짜 fired 제거
+    assert snooze == {"fresh": "2026-07-15T09:00:00+09:00"}  # 지난 날짜 스누즈 제거
+
+
+def test_notify_state_missing_file_empty(tmp_path):
+    assert load_notify_state(tmp_path / "nope.json", "2026-07-15") == (set(), {})
+
+
+def test_notify_state_snooze_across_midnight_preserved(tmp_path):
+    # 🟡 fix1: 23:55 스누즈 → refire 익일 00:25. 자정 전 재로드 시 내일 refire 가 보존돼야 한다.
+    # (구현이 == today 였다면 폐기됐다. >= today 로 지난 날짜만 폐기.)
+    p = tmp_path / "notify_state.json"
+    save_notify_state(p, set(), {"a": "2026-07-16T00:25:00+09:00"})
+    _fired, snooze = load_notify_state(p, "2026-07-15")
+    assert snooze == {"a": "2026-07-16T00:25:00+09:00"}
+
+
+def test_load_schedules_rejects_unsafe_id(tmp_path):
+    # 🟢 fix3: 방출측 id 검증 대칭 — charset 위반·과길이 항목은 조용히 skip.
+    p = tmp_path / "notify.json"
+    p.write_text(
+        '{"items": [{"id": "ok-1"}, {"id": "bad/id"}, {"id": ""}, {"id": 5}]}',
+        encoding="utf-8",
+    )
+    assert [it["id"] for it in load_schedules(p)] == ["ok-1"]
+
+
+def test_due_snoozes_tz_naive_iso_skipped():
+    # 🟢 fix2: tz-naive ISO(상태파일 손상) → aware↔naive 비교 TypeError 를 삼키고 skip.
+    assert due_snoozes({"a": "2026-07-15T09:00:00"}, _WED_0910) == []
+
+
+# ---------------------------------------------------------------------------
+# 상태변이·오케스트레이션: dispatch_notifications / handle_callback nb 분기
+#   전역 상태(notify_fired/notify_snooze) 격리 + send/edit/answer/save 스파이.
+# ---------------------------------------------------------------------------
+
+
+def _freeze_now(monkeypatch, fixed):
+    """bridge.datetime.now() 를 fixed 로 고정(fromisoformat 등은 실제 위임)."""
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, *_args, **_kwargs):
+            return fixed
+
+    monkeypatch.setattr(bridge, "datetime", FakeDatetime)
+
+
+@pytest.fixture
+def notify_env(monkeypatch):
+    """알림 전역 상태 격리 + send/edit/answer/save_notify_state 스파이."""
+    bridge.notify_fired.clear()
+    bridge.notify_snooze.clear()
+    calls = {"send": [], "edit": [], "answer": [], "save": []}
+
+    def fake_send(_token, chat_id, text, _secrets, reply_markup=None):
+        calls["send"].append((chat_id, text, reply_markup))
+
+    def fake_edit(_token, chat_id, message_id, text, _secrets):
+        calls["edit"].append((chat_id, message_id, text))
+
+    def fake_answer(_token, cq_id):
+        calls["answer"].append(cq_id)
+
+    def fake_save(_path, fired, snooze):
+        calls["save"].append((set(fired), dict(snooze)))
+
+    monkeypatch.setattr(bridge, "send_message", fake_send)
+    monkeypatch.setattr(bridge, "edit_message", fake_edit)
+    monkeypatch.setattr(bridge, "answer_callback", fake_answer)
+    monkeypatch.setattr(bridge, "save_notify_state", fake_save)
+    yield calls
+    bridge.notify_fired.clear()
+    bridge.notify_snooze.clear()
+
+
+def test_dispatch_fans_out_to_all_allowed_and_marks_fired(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0910)
+    bridge.dispatch_notifications("T", frozenset({111, 222}), [], [_item(id="a")])
+    # 허용목록 chat 전체에 팬아웃, 각 발송에 notify_keyboard 첨부
+    assert {c for c, _t, _m in notify_env["send"]} == {111, 222}
+    for _c, _t, markup in notify_env["send"]:
+        assert markup["inline_keyboard"][0][0]["callback_data"] == "nb:ok:a"
+    assert ("a", "2026-07-15") in bridge.notify_fired
+    assert len(notify_env["save"]) == 1
+
+
+def test_dispatch_snooze_refires_then_pops(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0931)  # 스케줄 창 밖 → due 아님, 스누즈만 발송
+    bridge.notify_fired.add(("a", "2026-07-15"))
+    bridge.notify_snooze["a"] = datetime(2026, 7, 15, 9, 20, tzinfo=_KST).isoformat()  # 지남
+    bridge.dispatch_notifications("T", frozenset({111}), [], [_item(id="a")])
+    assert len(notify_env["send"]) == 1
+    assert "a" not in bridge.notify_snooze  # 발송 후 pop(1회성)
+
+
+def test_dispatch_due_and_snooze_no_double_send(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0910)  # 창 안 → due 이면서 스누즈도 지남
+    bridge.notify_snooze["a"] = datetime(2026, 7, 15, 9, 0, tzinfo=_KST).isoformat()
+    bridge.dispatch_notifications("T", frozenset({111}), [], [_item(id="a")])
+    assert len(notify_env["send"]) == 1  # 병합 시 한 번만
+
+
+@pytest.mark.usefixtures("notify_env")
+def test_dispatch_prunes_stale_date(monkeypatch):
+    _freeze_now(monkeypatch, datetime(2026, 7, 15, 3, 0, tzinfo=_KST))
+    bridge.notify_fired.add(("old", "2026-07-14"))
+    bridge.dispatch_notifications("T", frozenset({111}), [], [])
+    assert ("old", "2026-07-14") not in bridge.notify_fired  # 날짜 롤오버 정리
+
+
+def test_dispatch_no_targets_no_send(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0931)  # 창 밖·스누즈 없음
+    bridge.dispatch_notifications("T", frozenset({111}), [], [_item(id="a")])
+    assert notify_env["send"] == []
+    assert notify_env["save"] == []
+
+
+def test_callback_nb_ok_edits_and_clears_snooze(notify_env, tmp_path):
+    bridge.notify_snooze["a"] = "2026-07-15T09:00:00+09:00"
+    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert notify_env["edit"][0][2].startswith("✅")  # 확인 접수·버튼 제거
+    assert "a" not in bridge.notify_snooze
+    assert len(notify_env["save"]) == 1  # 스누즈 변화 → save
+
+
+def test_callback_nb_ok_without_snooze_no_save(notify_env, tmp_path):
+    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert notify_env["edit"][0][2].startswith("✅")
+    assert notify_env["save"] == []  # 변화 없으면 불필요한 IO 없음
+
+
+def test_callback_nb_later_snoozes_and_saves(notify_env, monkeypatch, tmp_path):
+    _freeze_now(monkeypatch, _WED_0910)  # 09:10 → +30분 = 09:40
+    handle_callback(_cq(777, "nb:later:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert bridge.notify_snooze["a"].startswith("2026-07-15T09:40")
+    assert len(notify_env["save"]) == 1
+    assert notify_env["edit"][0][2].startswith("⏰")  # "30분 뒤" 안내·버튼 제거
+
+
+def test_callback_nb_disallowed_chat_ignored(notify_env, tmp_path):
+    # 보안: 미허용 chat 은 nb 분기도 게이트에서 즉시 거부.
+    handle_callback(_cq(999, "nb:later:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert notify_env["edit"] == []
+    assert notify_env["save"] == []
+    assert bridge.notify_snooze == {}
+
+
+# ===========================================================================
+# ② 사진 대조 — extract_photo / valid_ticker / parse_caption_ticker / stock_url
+#   parse_stock_response / build_compare_prompt (순수) + download_file/fetch_stock
+#   (urllib monkeypatch). 계약: 01-계획.md "② 사진 대조". 실제 네트워크 없음.
+# ===========================================================================
+
+
+def test_extract_photo_picks_max_resolution():
+    upd = {
+        "message": {
+            "photo": [
+                {"file_id": "s", "width": 90, "height": 90},
+                {"file_id": "m", "width": 320, "height": 240},
+                {"file_id": "l", "width": 1280, "height": 960},
+            ]
+        }
+    }
+    assert extract_photo(upd) == "l"
+
+
+def test_extract_photo_unordered_still_max():
+    # 오름차순 가정에 의존하지 않는다 — 큰 것이 배열 앞에 와도 선택.
+    upd = {
+        "message": {
+            "photo": [
+                {"file_id": "big", "width": 1000, "height": 1000},
+                {"file_id": "small", "width": 10, "height": 10},
+            ]
+        }
+    }
+    assert extract_photo(upd) == "big"
+
+
+def test_extract_photo_no_photo_key_none():
+    assert extract_photo({"message": {"text": "hi"}}) is None
+    assert extract_photo({"message": {}}) is None
+    assert extract_photo({}) is None
+
+
+def test_extract_photo_empty_list_none():
+    assert extract_photo({"message": {"photo": []}}) is None
+
+
+def test_extract_photo_ignores_non_dict_sizes():
+    upd = {"message": {"photo": ["oops", {"file_id": "ok", "width": 5, "height": 5}]}}
+    assert extract_photo(upd) == "ok"
+
+
+def test_valid_ticker_accepts_common():
+    for t in ("MU", "AAPL", "NQ=F", "^KS11", "005930", "0167A0", "BRK-B"):
+        assert valid_ticker(t)
+
+
+def test_valid_ticker_rejects_ssrf_and_traversal():
+    for bad in ("../etc", "A/B", "A\\B", "a b", "MU:8000", "..", "mu", "x" * 16, ""):
+        assert not valid_ticker(bad)
+
+
+def test_parse_caption_ticker_extracts_first_valid():
+    assert parse_caption_ticker("trading_info MU 대조") == "MU"
+    assert parse_caption_ticker("mu") == "MU"  # 대문자화
+    assert parse_caption_ticker("NQ=F 확인해줘") == "NQ=F"
+
+
+def test_parse_caption_ticker_none_when_no_ticker():
+    assert parse_caption_ticker("사진 좀 봐줘") is None
+    assert parse_caption_ticker("") is None
+
+
+def test_stock_url_fixed_host_path():
+    assert stock_url("MU") == "http://127.0.0.1:8000/api/stocks/MU"
+
+
+def test_stock_url_rejects_invalid_ticker():
+    with pytest.raises(ValueError, match="ticker"):
+        stock_url("../secret")
+    with pytest.raises(ValueError):
+        stock_url("A/B")
+
+
+def test_parse_stock_response_full():
+    payload = {
+        "change_percent": -3.1,
+        "change_amount": -4.2,
+        "session": "정규장",
+        "is_trading_day": True,
+        "current_price": 131.0,
+        "name": "마이크론",
+    }
+    out = parse_stock_response(payload)
+    assert out["change_percent"] == -3.1
+    assert out["session"] == "정규장"
+    assert out["name"] == "마이크론"
+
+
+def test_parse_stock_response_missing_fields_none():
+    # change_percent 는 현재가 없을 때 응답에서 빠질 수 있다 → None 안전.
+    out = parse_stock_response({"session": "프리마켓"})
+    assert out["change_percent"] is None
+    assert out["change_amount"] is None
+    assert out["session"] == "프리마켓"
+
+
+def test_build_compare_prompt_contains_values_and_no_commit():
+    prompt = build_compare_prompt(Path("logs/photos/x.jpg"), "MU", {"change_percent": -3.1})
+    assert "MU" in prompt
+    assert "-3.1" in prompt
+    assert "x.jpg" in prompt
+    assert "커밋은 하지" in prompt  # 되확인 안전핀(③ 전 폴백)
+
+
+# --- download_file / fetch_stock: urllib monkeypatch(실제 네트워크 없음) ---
+
+
+class _FakeResp:
+    def __init__(self, data=b"", headers=None):
+        self._data = data
+        self.headers = headers or {}
+
+    def read(self, n=-1):
+        return self._data if n is None or n < 0 else self._data[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _patch_urlopen(monkeypatch, resp):
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: resp)
+
+
+def test_download_file_writes_basename_only(monkeypatch, tmp_path):
+    _patch_urlopen(monkeypatch, _FakeResp(b"\xff\xd8jpegdata"))
+    dest = download_file("TOKEN", "photos/file_99.jpg", tmp_path)
+    assert dest.name == "file_99.jpg"
+    assert dest.parent == tmp_path  # 경로 성분 제거(트래버설 차단)
+    assert dest.read_bytes() == b"\xff\xd8jpegdata"
+
+
+def test_download_file_traversal_path_stays_in_dest(monkeypatch, tmp_path):
+    # file_path 에 상위 이동이 있어도 basename 만 → dest_dir 밖으로 못 나감.
+    _patch_urlopen(monkeypatch, _FakeResp(b"x"))
+    dest = download_file("T", "a/../../evil.png", tmp_path)
+    assert dest.name == "evil.png"
+    assert dest.parent == tmp_path
+
+
+def test_download_file_rejects_bad_extension(monkeypatch, tmp_path):
+    _patch_urlopen(monkeypatch, _FakeResp(b"x"))
+    with pytest.raises(ValueError, match="확장자"):
+        download_file("T", "photos/x.gif", tmp_path)
+
+
+def test_download_file_rejects_oversize_body(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "MAX_PHOTO_BYTES", 4)
+    _patch_urlopen(monkeypatch, _FakeResp(b"toolongbody"))
+    with pytest.raises(ValueError, match=r"10MB|상한"):
+        download_file("T", "photos/x.jpg", tmp_path)
+
+
+def test_download_file_rejects_oversize_content_length(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "MAX_PHOTO_BYTES", 4)
+    _patch_urlopen(monkeypatch, _FakeResp(b"ok", headers={"Content-Length": "999"}))
+    with pytest.raises(ValueError, match=r"10MB|상한"):
+        download_file("T", "photos/x.jpg", tmp_path)
+
+
+def test_fetch_stock_parses_response(monkeypatch):
+    body = b'{"change_percent": -3.1, "session": "\\uc815\\uaddc\\uc7a5", "name": "MU"}'
+    _patch_urlopen(monkeypatch, _FakeResp(body))
+    out = fetch_stock("MU")
+    assert out["change_percent"] == -3.1
+    assert out["session"] == "정규장"
+
+
+def test_fetch_stock_rejects_invalid_ticker_before_network(monkeypatch):
+    # SSRF: 무효 ticker 는 URL 조립 단계(stock_url)에서 차단 — 네트워크 도달 전.
+    called = {"n": 0}
+
+    def boom(*_a, **_k):
+        called["n"] += 1
+        raise AssertionError("네트워크 호출되면 안 됨")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    with pytest.raises(ValueError):
+        fetch_stock("../etc/passwd")
+    assert called["n"] == 0
+
+
+# --- handle_photo 오케스트레이션 (download/REST/run 스파이) + 게이트 대칭 ---
+
+
+def _photo_upd(chat_id, caption="MU", with_photo=True):
+    msg = {"chat": {"id": chat_id}}
+    if caption is not None:
+        msg["caption"] = caption
+    if with_photo:
+        msg["photo"] = [{"file_id": "f", "width": 100, "height": 100}]
+    return {"message": msg}
+
+
+@pytest.fixture
+def photo_spy(monkeypatch):
+    """send/run_claude_with_progress/tg_get_file/download_file/fetch_stock 를 해피패스 스파이로."""
+    calls = {"send": [], "run": [], "getfile": 0, "download": 0, "fetch": 0}
+
+    def fake_send(_t, chat_id, text, _s, _reply_markup=None):
+        calls["send"].append((chat_id, text))
+
+    def fake_run(*args):  # (token, chat_id, header, exe, proj, task, timeout, secrets, allowed)
+        calls["run"].append({"allowed_tools": args[8] if len(args) > 8 else None})
+        return {"result": "✅ 일치", "is_error": False}
+
+    def fake_getfile(_t, _fid):
+        calls["getfile"] += 1
+        return "photos/x.jpg"
+
+    def fake_download(_t, _fp, dest_dir):
+        calls["download"] += 1
+        return dest_dir / "x.jpg"  # 존재하지 않아도 unlink(missing_ok=True) 안전
+
+    def fake_fetch(_ticker):
+        calls["fetch"] += 1
+        return {"change_percent": -3.1, "session": "정규장"}
+
+    monkeypatch.setattr(bridge, "send_message", fake_send)
+    monkeypatch.setattr(bridge, "run_claude_with_progress", fake_run)
+    monkeypatch.setattr(bridge, "tg_get_file", fake_getfile)
+    monkeypatch.setattr(bridge, "download_file", fake_download)
+    monkeypatch.setattr(bridge, "fetch_stock", fake_fetch)
+    return calls
+
+
+def test_photo_no_caption_prompts_no_run(photo_spy, tmp_path):
+    (tmp_path / "trading_info").mkdir()
+    handle_photo(_photo_upd(777, caption=None), 777, "T", "c", str(tmp_path), 60, [])
+    assert photo_spy["run"] == []  # claude 미호출
+    assert any("캡션" in t for _c, t in photo_spy["send"])
+
+
+def test_photo_no_photo_size_prompts_no_run(photo_spy, tmp_path):
+    (tmp_path / "trading_info").mkdir()
+    upd = _photo_upd(777, caption="MU", with_photo=False)
+    handle_photo(upd, 777, "T", "c", str(tmp_path), 60, [])
+    assert photo_spy["run"] == []
+    assert any("사진을 읽지" in t for _c, t in photo_spy["send"])
+
+
+def test_photo_download_fail_graceful(photo_spy, monkeypatch, tmp_path):
+    (tmp_path / "trading_info").mkdir()
+
+    def boom(*_a):
+        raise OSError("net down")
+
+    monkeypatch.setattr(bridge, "tg_get_file", boom)
+    handle_photo(_photo_upd(777), 777, "T", "c", str(tmp_path), 60, [])
+    assert photo_spy["run"] == []
+    assert any("내려받지" in t for _c, t in photo_spy["send"])
+
+
+def test_photo_rest_fail_graceful(photo_spy, monkeypatch, tmp_path):
+    (tmp_path / "trading_info").mkdir()
+
+    def boom(_t):
+        raise OSError("conn refused")  # 서버(:8000) 미기동 상황
+
+    monkeypatch.setattr(bridge, "fetch_stock", boom)
+    handle_photo(_photo_upd(777), 777, "T", "c", str(tmp_path), 60, [])
+    assert photo_spy["run"] == []
+    assert any("REST 응답 없음" in t for _c, t in photo_spy["send"])
+
+
+def test_photo_normal_runs_with_read_only_tools(photo_spy, tmp_path):
+    # M-1 회귀 잠금: 사진 대조 run 은 반드시 Read 전용 도구셋으로 호출.
+    (tmp_path / "trading_info").mkdir()
+    handle_photo(
+        _photo_upd(777, caption="trading_info MU 대조"), 777, "T", "c", str(tmp_path), 60, []
+    )
+    assert len(photo_spy["run"]) == 1
+    assert photo_spy["run"][0]["allowed_tools"] == ["Read"]
+    assert photo_spy["fetch"] == 1
+
+
+def test_photo_disallowed_chat_never_downloads(monkeypatch, tmp_path):
+    # 보안 회귀 잠금: 미허용 chat 의 사진은 handle_update 게이트에서 차단 → handle_photo 미도달.
+    reached = []
+    monkeypatch.setattr(bridge, "handle_photo", lambda *_a, **_k: reached.append(1))
+    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
+    handle_update(_photo_upd(999), "T", frozenset({777}), "c", tmp_path, str(tmp_path), 60, [])
+    assert reached == []
+
+
+def test_photo_allowed_chat_triggers_handler(monkeypatch, tmp_path):
+    reached = []
+    monkeypatch.setattr(bridge, "handle_photo", lambda *_a, **_k: reached.append(1))
+    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
+    handle_update(_photo_upd(777), "T", frozenset({777}), "c", tmp_path, str(tmp_path), 60, [])
+    assert reached == [1]
+
+
+# ===========================================================================
+# ③ 버튼 선택지 — parse_choice_prompt / choice_keyboard / parse_callback(c)
+#   handle_callback c 분기 · await_reply 라우팅. 계약: 01-계획.md "③ 버튼 선택지".
+# ===========================================================================
+
+
+def test_parse_choice_prompt_normal():
+    out = parse_choice_prompt("옵션을 고르세요.\n❓선택: [유지|keep]|[교체|swap]")
+    assert out == ("옵션을 고르세요.", [("유지", "keep"), ("교체", "swap")])
+
+
+def test_parse_choice_prompt_inline_question_default():
+    # 질문 텍스트가 없으면 기본 문구.
+    out = parse_choice_prompt("❓선택: [예|yes]|[아니오|no]")
+    assert out == ("선택하세요", [("예", "yes"), ("아니오", "no")])
+
+
+def test_parse_choice_prompt_colon_newline():
+    # 🟡 회귀: claude 가 콜론 뒤 개행해도 tail 전체 스캔으로 파싱(왕복 붕괴 방지).
+    out = parse_choice_prompt("무엇을 할까요?\n❓선택:\n[유지|keep]|[교체|swap]")
+    assert out == ("무엇을 할까요?", [("유지", "keep"), ("교체", "swap")])
+
+
+def test_parse_choice_prompt_multiline_choices():
+    # 선택지가 여러 줄에 걸쳐도 대괄호 그룹을 모두 수집.
+    out = parse_choice_prompt("❓선택:\n[예|yes]\n[아니오|no]")
+    assert out == ("선택하세요", [("예", "yes"), ("아니오", "no")])
+
+
+def test_parse_choice_prompt_non_choice_none():
+    assert parse_choice_prompt("작업을 완료했습니다.") is None
+    assert parse_choice_prompt("") is None
+
+
+def test_parse_choice_prompt_broken_grammar_none():
+    assert parse_choice_prompt("❓선택: [값없음]") is None  # `|` 누락
+    assert parse_choice_prompt("❓선택: []|[|]") is None  # 빈 항목·빈 라벨/값
+    assert parse_choice_prompt("❓선택: 아무거나") is None  # 대괄호 없음
+
+
+def test_parse_choice_prompt_skips_malformed_keeps_valid():
+    out = parse_choice_prompt("❓선택: [좋음|a]|[깨짐]|[나쁨|b]")
+    assert out == ("선택하세요", [("좋음", "a"), ("나쁨", "b")])
+
+
+def test_parse_choice_prompt_uses_last_marker():
+    # 여러 줄 중 마지막 ❓선택 줄만 파싱(마지막 줄 규약).
+    text = "설명 ❓선택: [무시|x]\n최종 질문\n❓선택: [진짜A|a]|[진짜B|b]"
+    out = parse_choice_prompt(text)
+    assert out is not None
+    assert out[1] == [("진짜A", "a"), ("진짜B", "b")]
+
+
+def test_choice_keyboard_structure():
+    kb = choice_keyboard(77, [("유지", "keep"), ("교체", "swap")])
+    flat = [b for row in kb["inline_keyboard"] for b in row]
+    assert flat[0]["callback_data"] == "c:77:0"
+    assert flat[1]["callback_data"] == "c:77:1"
+    assert flat[-1] == {"text": "✏️ 직접입력", "callback_data": "c:77:other"}
+
+
+def test_choice_keyboard_two_per_row():
+    kb = choice_keyboard(1, [("a", "1"), ("b", "2"), ("c", "3")])
+    # 3 선택지 + 직접입력 = 4버튼 → 2개씩 2행.
+    assert [len(r) for r in kb["inline_keyboard"]] == [2, 2]
+
+
+def test_choice_keyboard_callback_data_within_64_bytes():
+    kb = choice_keyboard(123456, [("긴라벨" * 30, "v")])
+    for row in kb["inline_keyboard"]:
+        for btn in row:
+            assert len(btn["callback_data"].encode("utf-8")) <= 64
+
+
+def test_parse_callback_choice_index():
+    assert parse_callback("c:55:0") == ("c", "55:0")
+    assert parse_callback("c:55:12") == ("c", "55:12")
+
+
+def test_parse_callback_choice_other():
+    assert parse_callback("c:55:other") == ("c", "55:other")
+
+
+def test_parse_callback_choice_rejects_bad():
+    assert parse_callback("c:x:1") is None  # msg_id 비정수
+    assert parse_callback("c:55:bad") is None  # sel 비정수·비other
+    assert parse_callback("c:55") is None  # 파트 부족
+    assert parse_callback("c:55:1:2") is None  # 파트 초과
+
+
+def test_parse_callback_choice_rejects_unicode_digits():
+    # L-3: 전각·위첨자 등 유니코드 숫자(int 통과, isascii 실패)를 차단.
+    fullwidth = "c:" + chr(0xFF15) * 2 + ":1"  # 전각 숫자 msg_id(FULLWIDTH DIGIT FIVE)
+    superscript = "c:55:" + chr(0x00B2)  # 위첨자 숫자 idx(SUPERSCRIPT TWO)
+    assert parse_callback(fullwidth) is None
+    assert parse_callback(superscript) is None
+
+
+# --- handle_callback c 분기 · await_reply 라우팅 (resume_run 스파이) ---
+
+
+@pytest.fixture
+def choice_env(monkeypatch):
+    """pending 격리 + answer/send/edit/resume_run 스파이(실제 claude 미실행)."""
+    bridge.pending.clear()
+    calls = {"answer": [], "send": [], "edit": [], "resume": []}
+
+    def fake_answer(_t, cq_id):
+        calls["answer"].append(cq_id)
+
+    def fake_send(_t, chat_id, text, _s, _rm=None):
+        calls["send"].append((chat_id, text))
+
+    def fake_edit(_t, _cid, message_id, text, _s):
+        calls["edit"].append((message_id, text))
+
+    def fake_resume(_tok, _cid, _exe, proj, answer, question, sid, _to, _sec):
+        calls["resume"].append({"proj": proj, "answer": answer, "sid": sid, "question": question})
+
+    monkeypatch.setattr(bridge, "answer_callback", fake_answer)
+    monkeypatch.setattr(bridge, "send_message", fake_send)
+    monkeypatch.setattr(bridge, "edit_message", fake_edit)
+    monkeypatch.setattr(bridge, "resume_run", fake_resume)
+    yield calls
+    bridge.pending.clear()
+
+
+def _pending_entry(await_reply=False, chat_id=777):
+    return {
+        "chat_id": chat_id,
+        "session_id": "sid1",
+        "project_path": "/proj",
+        "choices": [("유지", "keep"), ("교체", "swap")],
+        "question": "무엇을?",
+        "await_reply": await_reply,
+    }
+
+
+def test_callback_choice_selection_resumes(choice_env):
+    bridge.pending[50] = _pending_entry()
+    handle_callback(_cq(777, "c:50:1"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
+    assert len(choice_env["resume"]) == 1
+    r = choice_env["resume"][0]
+    assert r["answer"] == "swap" and r["sid"] == "sid1" and r["proj"] == "/proj"
+    assert 50 not in bridge.pending  # 소비(중복 탭 방지)
+    assert any("교체" in t for _mid, t in choice_env["edit"])  # 버튼 제거 edit
+
+
+def test_callback_choice_other_sets_await(choice_env):
+    bridge.pending[50] = _pending_entry()
+    handle_callback(_cq(777, "c:50:other"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
+    assert bridge.pending[50]["await_reply"] is True
+    assert choice_env["resume"] == []
+    assert any("답장으로" in t for _c, t in choice_env["send"])
+
+
+def test_callback_choice_expired_pending(choice_env):
+    # 재시작 등으로 보류맵에 없으면 만료 안내(claude 미실행).
+    handle_callback(_cq(777, "c:99:0"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
+    assert choice_env["resume"] == []
+    assert any("만료" in t for _mid, t in choice_env["edit"])
+
+
+def test_callback_choice_out_of_range_ignored(choice_env):
+    bridge.pending[50] = _pending_entry()  # 선택지 2개(0,1)
+    handle_callback(_cq(777, "c:50:5"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
+    assert choice_env["resume"] == []  # 범위 밖 → 무시
+    assert 50 in bridge.pending  # 소비 안 함
+
+
+def test_callback_choice_disallowed_chat_blocked(choice_env):
+    bridge.pending[50] = _pending_entry()
+    handle_callback(_cq(999, "c:50:0"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
+    assert choice_env["resume"] == []
+    assert choice_env["answer"] == []  # 허용목록 게이트에서 즉시 차단
+    assert bridge.pending[50]["await_reply"] is False
+
+
+def _text_upd(chat_id, text):
+    return {"message": {"chat": {"id": chat_id}, "text": text}}
+
+
+def test_await_reply_routes_text_to_resume(choice_env):
+    bridge.pending[50] = _pending_entry(await_reply=True)
+    handle_update(_text_upd(777, "직접 입력한 답"), "T", _ALLOWED, "claude", Path(), "root", 60, [])
+    assert len(choice_env["resume"]) == 1
+    assert choice_env["resume"][0]["answer"] == "직접 입력한 답"
+    assert 50 not in bridge.pending  # 소비
+
+
+def test_await_reply_cancel_clears(choice_env):
+    bridge.pending[50] = _pending_entry(await_reply=True)
+    handle_update(_text_upd(777, "/cancel"), "T", _ALLOWED, "claude", Path(), "root", 60, [])
+    assert 50 not in bridge.pending
+    assert choice_env["resume"] == []  # /cancel 은 resume 하지 않음
+    assert any("취소" in t for _c, t in choice_env["send"])
+
+
+# --- M-1: pending chat_id 격리 (타 chat 세션 탈취 방지) ---
+
+_ALLOWED2 = frozenset({777, 888})
+
+
+def test_callback_choice_other_chat_rejected(choice_env):
+    bridge.pending[50] = _pending_entry(chat_id=777)  # 777 소유
+    handle_callback(_cq(888, "c:50:1"), "T", _ALLOWED2, Path(), "root", [], "claude", 60)
+    assert choice_env["resume"] == []  # 888 은 이어받지 못함(만료 취급)
+    assert 50 in bridge.pending  # 777 항목 그대로
+
+
+def test_await_reply_other_chat_not_routed(choice_env):
+    bridge.pending[50] = _pending_entry(await_reply=True, chat_id=777)
+    handle_update(_text_upd(888, "가로채기 시도"), "T", _ALLOWED2, "claude", Path(), "root", 60, [])
+    assert choice_env["resume"] == []  # 888 답장이 777 세션으로 안 감
+    assert 50 in bridge.pending  # 777 대기 유지
+
+
+@pytest.mark.usefixtures("choice_env")
+def test_cancel_other_chat_keeps_await():
+    bridge.pending[50] = _pending_entry(await_reply=True, chat_id=777)
+    handle_update(_text_upd(888, "/cancel"), "T", _ALLOWED2, "claude", Path(), "root", 60, [])
+    assert 50 in bridge.pending  # 888 /cancel 이 777 대기를 해제하지 못함
+
+
+# --- 핵심 배선 회귀 잠금: _render_choices / resume_run / run_claude_with_progress ---
+
+
+def test_render_choices_registers_pending_and_keyboard(monkeypatch):
+    bridge.pending.clear()
+    kb_calls = []
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 200)
+    monkeypatch.setattr(
+        bridge, "edit_message_reply_markup", lambda _t, _c, mid, kb: kb_calls.append((mid, kb))
+    )
+    bridge._render_choices("T", 777, "/proj", "sid-abc", ("Q", [("유지", "keep")]), [])
+    assert 200 in bridge.pending
+    e = bridge.pending[200]
+    assert e["chat_id"] == 777 and e["session_id"] == "sid-abc" and e["project_path"] == "/proj"
+    assert kb_calls and kb_calls[0][0] == 200  # 얻은 message_id 로 키보드 부착
+    bridge.pending.clear()
+
+
+def test_render_choices_skips_without_session_id(monkeypatch):
+    bridge.pending.clear()
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 200)
+    bridge._render_choices("T", 777, "/proj", None, ("Q", [("a", "1")]), [])  # session_id 없음
+    assert bridge.pending == {}
+    bridge._render_choices("T", 777, "/proj", 123, ("Q", [("a", "1")]), [])  # 비-str
+    assert bridge.pending == {}
+
+
+def test_render_choices_masks_label(monkeypatch):
+    # L-2: 라벨은 마스킹 안 된 result 재파싱분 → 버튼 text·저장분 모두 마스킹돼야.
+    bridge.pending.clear()
+    captured = {}
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 200)
+    monkeypatch.setattr(
+        bridge, "edit_message_reply_markup", lambda _t, _c, _m, kb: captured.update(kb=kb)
+    )
+    bridge._render_choices("T", 777, "/p", "sid-1", ("Q", [("토큰SECRET표시", "v")]), ["SECRET"])
+    label = captured["kb"]["inline_keyboard"][0][0]["text"]
+    assert "SECRET" not in label and "***" in label
+    assert bridge.pending[200]["choices"][0][0] == label  # 저장분도 마스킹
+    bridge.pending.clear()
+
+
+def test_resume_run_fallback_on_resume_error(monkeypatch):
+    # 🟢 resume 실패(is_error) → --resume 없이 직전 질문+답 요약 재주입 폴백.
+    calls = []
+
+    def stub(_tok, _cid, _hdr, _exe, _proj, task, _to, _sec, **kw):
+        calls.append({"task": task, "resume": kw.get("resume")})
+        return {"is_error": len(calls) == 1, "result": ""}  # 첫(resume) 실패, 폴백 성공
+
+    monkeypatch.setattr(bridge, "run_claude_with_progress", stub)
+    bridge.resume_run("T", 777, "claude", "/p", "내 답", "원 질문", "sid-1", 60, [])
+    assert len(calls) == 2
+    assert calls[0]["resume"] == "sid-1"  # 1차: resume 시도
+    assert calls[1]["resume"] is None  # 2차: 폴백(resume 없음)
+    assert "원 질문" in calls[1]["task"] and "내 답" in calls[1]["task"]  # 맥락 재주입
+
+
+def test_rcwp_read_only_skips_choice_render(monkeypatch):
+    # 사진 Read 경로(allowed_tools=["Read"])는 ❓선택이 있어도 버튼 렌더 안 함.
+    bridge.pending.clear()
+
+    def fake_run(*_a, **_k):
+        return {"result": "Q\n❓선택: [a|1]|[b|2]", "is_error": False, "session_id": "s"}
+
+    monkeypatch.setattr(bridge, "run_claude", fake_run)
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 10)
+    monkeypatch.setattr(bridge, "edit_message", lambda *_a: None)
+    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "edit_message_reply_markup", lambda *_a: None)
+    bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [], ["Read"])
+    assert bridge.pending == {}
+    bridge.pending.clear()
+
+
+def test_rcwp_full_path_renders_and_hides_marker(monkeypatch):
+    # full 경로: ❓선택 감지 → 버튼 렌더 + 최종 회신에서 마커 줄 숨김(#5).
+    bridge.pending.clear()
+    edits = []
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {
+            "result": "고르세요\n❓선택: [유지|keep]|[교체|swap]",
+            "is_error": False,
+            "session_id": "sid-1",
+        },
+    )
+    ids = iter([10, 11])
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: next(ids))
+    monkeypatch.setattr(bridge, "edit_message", lambda _t, _c, _m, txt, _s: edits.append(txt))
+    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "edit_message_reply_markup", lambda *_a: None)
+    bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [])
+    assert edits and all("❓선택" not in t for t in edits)  # 내부 문법 미노출
+    assert 11 in bridge.pending  # 버튼 메시지(두 번째 id)에 보류맵 등록
+    assert bridge.pending[11]["chat_id"] == 777
+    bridge.pending.clear()

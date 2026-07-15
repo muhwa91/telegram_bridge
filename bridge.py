@@ -112,6 +112,14 @@ notify_snooze: dict[str, str] = {}  # id -> 재발송 ISO datetime(KST)
 # 재시작 시 진행 중 선택은 유실 수용 — 사용자가 다시 요청하면 새 세션으로 복구된다.
 pending: dict[int, dict[str, Any]] = {}
 
+# ④ chat 프로젝트 선택 고정 — chat_id -> 프로젝트명. 버튼 탭·명시 실행이 갱신(덮어쓰기).
+# 이후 프로젝트명 없이 작업만 보내면 이 선택으로 실행한다(연속 지시 편의). chat_id 키라
+# M-1 격리 유지(한 chat 의 선택이 다른 chat 으로 새지 않음).
+# ponytail: 모듈 레벨 in-memory(pending·notify 전역과 동일 전략). TTL 없음 —
+#   계약이 "덮어쓰기 전까지 유지"라 만료는 오히려 UX 를 해친다(연속 지시 편의).
+#   재시작 시 유실은 수용 — 다시 버튼을 탭하면 복구된다.
+chat_selection: dict[int, str] = {}
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 순수 함수 (qa 병렬 테스트 대상 — 시그니처 고정)
@@ -152,6 +160,31 @@ def resolve_project(name: str, target_root: str) -> str | None:
         return None
     if exact and candidate.is_dir():
         return str(candidate)
+    return None
+
+
+def resolve_target(
+    text: str, target_root: str, selected: str | None
+) -> tuple[str, str, str] | None:
+    """메시지 + 현재 chat 선택 → (프로젝트명, 절대경로, task) | None. 순수 함수(테스트 대상).
+
+    ④ 선택 고정 해석:
+    - 첫 단어가 유효 프로젝트면 → 명시 우선: 그 프로젝트 + 나머지 task(없으면 "" = 선택만).
+    - 첫 단어가 프로젝트가 아니고 chat 선택이 유효하면 → 그 선택 + 메시지 전체를 task 로.
+    - 둘 다 아니면 None(첫 진입 안내).
+    명시·선택 모두 resolve_project 를 거쳐 트래버설·무효(삭제된) 폴더를 실행 직전 차단한다.
+    """
+    stripped = text.strip()
+    parts = stripped.split(maxsplit=1)
+    first = parts[0] if parts else ""
+    explicit = resolve_project(first, target_root)
+    if explicit is not None:
+        task = parts[1].strip() if len(parts) > 1 else ""
+        return (first, explicit, task)
+    if selected:
+        sel_path = resolve_project(selected, target_root)
+        if sel_path is not None:
+            return (selected, sel_path, stripped)
     return None
 
 
@@ -269,8 +302,11 @@ def parse_callback(data: str) -> tuple[str, str] | None:
 
 
 def project_guide(name: str) -> str:
-    """프로젝트 버튼 탭 시 안내 문구(상태 저장 없음 — 이어서 보내라는 안내만)."""
-    return f"{name} 프로젝트 — 작업 지시를 이어서 보내세요. 예) {name} README 고쳐줘"
+    """프로젝트 버튼 탭 시 안내 문구(선택 고정 — 이후 프로젝트명 없이 작업만 보내면 됨)."""
+    return (
+        f"{name} 프로젝트를 선택했습니다. 이제 프로젝트명 없이 작업만 보내도 "
+        f"이 프로젝트에서 실행됩니다. 예) README 고쳐줘"
+    )
 
 
 def _valid_id(s: object) -> bool:
@@ -1285,7 +1321,7 @@ def handle_callback(
     claude_exe: str = "",
     timeout: int = 900,
 ) -> None:
-    """인라인 버튼 탭(callback_query) 처리. 화이트리스트 라우팅·상태 저장 없음.
+    """인라인 버튼 탭(callback_query) 처리. 화이트리스트 라우팅(p: 는 chat 선택 고정).
 
     보안: chat ID 허용목록 게이트를 answerCallbackQuery·라우팅보다 **먼저** 통과시킨다.
     callback_data 는 신뢰 경계 밖이라 parse_callback 의 정확 매칭만 분기(임의 실행 금지),
@@ -1314,11 +1350,12 @@ def handle_callback(
     message_id = message.get("message_id") if isinstance(message, dict) else None
 
     if action == "p":
-        # 상태 저장 없이 안내만 — resolve_project 로 유효성 재확인, 무효면 무시.
+        # ④ 선택 고정 — resolve_project 로 유효성 재확인 후 chat_selection 에 저장(무효면 무시).
         if resolve_project(arg, target_root) is None:
             log.warning("미확인 프로젝트 callback=%r 무시", arg)
             return
-        log.info("chat=%s callback project=%s", chat_id, arg)
+        chat_selection[chat_id] = arg  # 이후 프로젝트명 생략 메시지가 이 프로젝트로 실행됨
+        log.info("chat=%s callback project=%s 선택 고정", chat_id, arg)
         send_message(token, chat_id, project_guide(arg), secrets)
     elif action == "push":
         log.info("chat=%s callback push", chat_id)
@@ -1487,20 +1524,21 @@ def handle_update(
         log.info("chat=%s push 결과=%s", chat_id, outcome)
         return
 
-    parsed = parse_message(text)
-    if parsed is None:
+    # ④ 선택 고정 해석: 첫 단어가 유효 프로젝트면 명시 우선, 아니면 chat 선택으로 실행.
+    target = resolve_target(text, target_root, chat_selection.get(chat_id))
+    if target is None:
         names = list_projects(target_root)
-        body = f"형식을 이해하지 못했습니다.\n\n{HELP_TEXT}"
+        first = stripped.split(maxsplit=1)[0] if stripped else ""
+        body = f"'{first}' 프로젝트를 찾지 못했습니다.\n대상: " + (", ".join(names) or "(없음)")
+        # 보안: 사용자 입력 first 를 %r 로 로깅해 개행 위조(로그 포깅)를 차단.
+        log.warning("chat=%s 알수없는 프로젝트=%r", chat_id, first)
         send_message(token, chat_id, body, secrets, project_keyboard(names))
         return
-    project, task = parsed
-    proj_path = resolve_project(project, target_root)
-    if proj_path is None:
-        names = list_projects(target_root)
-        body = f"'{project}' 프로젝트를 찾지 못했습니다.\n대상: " + (", ".join(names) or "(없음)")
-        # 보안: 사용자 입력 project 를 %r 로 로깅해 개행 위조(로그 포깅)를 차단.
-        log.warning("chat=%s 알수없는 프로젝트=%r", chat_id, project)
-        send_message(token, chat_id, body, secrets, project_keyboard(names))
+    project, proj_path, task = target
+    chat_selection[chat_id] = project  # 선택 고정/갱신(명시·fallback 공통, 덮어쓰기)
+    if not task:
+        # 프로젝트명만 보냄(작업 없음) — 버튼 탭과 동일하게 선택만 고정하고 안내.
+        send_message(token, chat_id, project_guide(project), secrets)
         return
 
     log.info("chat=%s 실행 project=%s", chat_id, project)
@@ -1644,6 +1682,19 @@ def _selftest() -> None:
     assert resolve_project("C:", str(PROJECT_DIR)) is None
     assert resolve_project("nope_missing", str(PROJECT_DIR)) is None
     assert resolve_project("logs", str(PROJECT_DIR)) == str(PROJECT_DIR / "logs")
+    # ④ chat 선택 고정 해석(순수): 명시 우선 · 선택 fallback(전체 task) · 첫 진입/stale None.
+    assert resolve_target("logs 상태 봐줘", str(PROJECT_DIR), None) == (
+        "logs",
+        str(PROJECT_DIR / "logs"),
+        "상태 봐줘",
+    )
+    assert resolve_target("아무거나 물어봄", str(PROJECT_DIR), "logs") == (
+        "logs",
+        str(PROJECT_DIR / "logs"),
+        "아무거나 물어봄",
+    )
+    assert resolve_target("아무거나 물어봄", str(PROJECT_DIR), None) is None
+    assert resolve_target("작업 해줘", str(PROJECT_DIR), "nope_gone") is None
     assert chunk_text("") == [""]
     assert chunk_text("abcd", 2) == ["ab", "cd"]
     assert mask_secrets("tok=SECRET here", ["SECRET"]) == "tok=*** here"

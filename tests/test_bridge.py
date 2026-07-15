@@ -47,6 +47,7 @@ from bridge import (
     project_keyboard,
     push_keyboard,
     resolve_project,
+    resolve_target,
     run_claude,
     save_notify_state,
     stock_url,
@@ -180,6 +181,70 @@ def test_resolve_project_absolute_path_rejected(tmp_path):
 
 def test_resolve_project_empty_name_rejected(tmp_path):
     assert resolve_project("", str(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_target: ④ chat 선택 고정 해석 (명시 우선 · 선택 fallback · 첫 진입/stale None)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_target_explicit_project_first_word(tmp_path):
+    (tmp_path / "trading_info").mkdir()
+    got = resolve_target("trading_info 헤더 고쳐줘", str(tmp_path), None)
+    assert got is not None
+    name, path, task = got
+    assert name == "trading_info"
+    assert Path(path).name == "trading_info"
+    assert task == "헤더 고쳐줘"
+
+
+def test_resolve_target_uses_selection_when_first_word_not_project(tmp_path):
+    # (a) 버튼 선택 후 프로젝트명 없는 메시지 → 선택 프로젝트 + 메시지 전체가 task
+    (tmp_path / "trading_info").mkdir()
+    got = resolve_target("시간대 별로 체크하는거 각 몇시에 오지?", str(tmp_path), "trading_info")
+    assert got is not None
+    name, _path, task = got
+    assert name == "trading_info"
+    assert task == "시간대 별로 체크하는거 각 몇시에 오지?"  # 첫 단어까지 포함한 전체
+
+
+def test_resolve_target_explicit_overrides_selection(tmp_path):
+    # (b) 프로젝트명 명시 → 명시 우선(선택이 있어도 그걸 덮어쓸 이름을 반환)
+    (tmp_path / "trading_info").mkdir()
+    (tmp_path / "etf_info").mkdir()
+    name, path, task = resolve_target("etf_info 로그 봐줘", str(tmp_path), "trading_info")
+    assert name == "etf_info"
+    assert Path(path).name == "etf_info"
+    assert task == "로그 봐줘"
+
+
+def test_resolve_target_no_selection_no_project_none(tmp_path):
+    # (c) 선택 없고 프로젝트명 아님 → None(첫 진입 안내)
+    (tmp_path / "trading_info").mkdir()
+    assert resolve_target("시간대 별로 체크", str(tmp_path), None) is None
+
+
+def test_resolve_target_stale_selection_rejected(tmp_path):
+    # 선택된 폴더가 사라졌으면(resolve None) 선택 fallback 무효 → None(트래버설/무효 방어 재통과)
+    assert resolve_target("작업 해줘", str(tmp_path), "gone_project") is None
+
+
+def test_resolve_target_bare_project_name_empty_task(tmp_path):
+    # 프로젝트명만(작업 없음) → 이름·경로 반환, task="" (호출측이 선택만 고정)
+    (tmp_path / "trading_info").mkdir()
+    name, _path, task = resolve_target("trading_info", str(tmp_path), None)
+    assert name == "trading_info"
+    assert task == ""
+
+
+def test_resolve_target_traversal_first_word_falls_through_to_selection(tmp_path):
+    # 첫 단어가 트래버설이면 명시 실패 → 유효 선택으로 fallback(전체 메시지 task)
+    (tmp_path / "trading_info").mkdir()
+    got = resolve_target("../etc 해줘", str(tmp_path), "trading_info")
+    assert got is not None
+    name, _path, task = got
+    assert name == "trading_info"
+    assert task == "../etc 해줘"
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +391,7 @@ def test_event_to_progress_text_stripped():
 
 def test_event_to_progress_masks_secret_before_truncation():
     # L-1: 경계에서 비밀값이 쪼개져 조각이 새지 않도록, 잘라내기 전에 마스킹해야 한다.
-    secret = "C:\\Users\\Example"
+    secret = "C:\\Users\\Home"
     # secret 이 60자 경계에 걸치도록 배치(prefix 55 → secret 이 55~68 위치).
     # 마스킹을 안 하면 [:60] 이 "...C:\\Us" 같은 조각을 남긴다.
     cmd = "a" * 55 + secret + "tail"
@@ -1711,3 +1776,97 @@ def test_rcwp_full_path_renders_and_hides_marker(monkeypatch):
     assert 11 in bridge.pending  # 버튼 메시지(두 번째 id)에 보류맵 등록
     assert bridge.pending[11]["chat_id"] == 777
     bridge.pending.clear()
+
+
+# ===========================================================================
+# ④ chat 프로젝트 선택 고정 — 버튼 탭 → 프로젝트명 생략 실행 · 명시 우선 갱신 · chat 격리.
+#   handle_callback(p:) / handle_update 배선. run_claude_with_progress·git 스파이.
+# ===========================================================================
+
+
+@pytest.fixture
+def sel_env(monkeypatch):
+    """chat_selection 격리 + run_claude_with_progress·send·git 스파이(실제 claude 미실행)."""
+    bridge.chat_selection.clear()
+    calls = {"run": [], "send": []}
+
+    def fake_run(_tok, chat_id, _hdr, _exe, proj_path, task, _to, _sec, **_kw):
+        calls["run"].append((chat_id, proj_path, task))
+        return {"is_error": False, "result": "ok"}
+
+    def fake_send(_t, chat_id, text, _s, _rm=None):
+        calls["send"].append((chat_id, text))
+
+    monkeypatch.setattr(bridge, "run_claude_with_progress", fake_run)
+    monkeypatch.setattr(bridge, "send_message", fake_send)
+    monkeypatch.setattr(bridge, "answer_callback", lambda *_a: None)
+    monkeypatch.setattr(bridge, "git_status_note", lambda _root: "변경 없음.")
+    monkeypatch.setattr(bridge, "git_ahead", lambda _root: 0)
+    yield calls
+    bridge.chat_selection.clear()
+
+
+def _sel_msg(chat_id, text):
+    return {"message": {"chat": {"id": chat_id}, "text": text}}
+
+
+def test_button_select_then_bare_task_uses_selection(sel_env, tmp_path):
+    # (a) 버튼 탭으로 선택 고정 → 프로젝트명 없는 메시지가 그 프로젝트로 실행(전체가 task)
+    (tmp_path / "trading_info").mkdir()
+    root = str(tmp_path)
+    handle_callback(_cq(777, "p:trading_info"), "T", _ALLOWED, tmp_path, root, [])
+    assert bridge.chat_selection[777] == "trading_info"
+    handle_update(
+        _sel_msg(777, "시간대 별로 체크 각 몇시?"), "T", _ALLOWED, "c", tmp_path, root, 900, []
+    )
+    assert sel_env["run"] == [(777, str(tmp_path / "trading_info"), "시간대 별로 체크 각 몇시?")]
+
+
+def test_explicit_message_updates_selection(sel_env, tmp_path):
+    # (b) 명시 우선 + 선택 갱신 → 이후 프로젝트명 생략 시 갱신된 선택으로 실행
+    (tmp_path / "trading_info").mkdir()
+    (tmp_path / "etf_info").mkdir()
+    root = str(tmp_path)
+    handle_update(
+        _sel_msg(777, "trading_info 헤더 고쳐"), "T", _ALLOWED, "c", tmp_path, root, 900, []
+    )
+    assert bridge.chat_selection[777] == "trading_info"
+    handle_update(_sel_msg(777, "etf_info 로그 봐줘"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
+    assert bridge.chat_selection[777] == "etf_info"  # 명시로 덮어쓰기
+    handle_update(_sel_msg(777, "이번엔 이거 해줘"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
+    assert sel_env["run"][-1][:2] == (777, str(tmp_path / "etf_info"))
+    assert sel_env["run"][-1][2] == "이번엔 이거 해줘"
+
+
+def test_no_selection_no_project_errors(sel_env, tmp_path):
+    # (c) 선택 없고 프로젝트명 아님 → 실행 없이 "프로젝트 못 찾음" 안내
+    (tmp_path / "trading_info").mkdir()
+    handle_update(
+        _sel_msg(777, "시간대 별로 체크"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
+    )
+    assert sel_env["run"] == []
+    assert any("찾지 못했" in t for _c, t in sel_env["send"])
+    assert 777 not in bridge.chat_selection
+
+
+def test_selection_isolated_per_chat(sel_env, tmp_path):
+    # (d) 한 chat 의 선택은 다른 chat 으로 새지 않는다(M-1 격리)
+    (tmp_path / "trading_info").mkdir()
+    root = str(tmp_path)
+    allowed = frozenset({777, 888})
+    handle_callback(_cq(777, "p:trading_info"), "T", allowed, tmp_path, root, [])
+    assert bridge.chat_selection == {777: "trading_info"}  # 888 미설정
+    # chat 888 은 선택 없음 → 프로젝트명 없는 메시지는 에러(실행 없음)
+    handle_update(_sel_msg(888, "시간대 별로"), "T", allowed, "c", tmp_path, root, 900, [])
+    assert sel_env["run"] == []
+    assert 888 not in bridge.chat_selection
+
+
+def test_bare_project_name_pins_selection_without_running(sel_env, tmp_path):
+    # 프로젝트명만 보내면(작업 없음) 선택만 고정하고 안내(실행 없음)
+    (tmp_path / "trading_info").mkdir()
+    root = str(tmp_path)
+    handle_update(_sel_msg(777, "trading_info"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
+    assert bridge.chat_selection[777] == "trading_info"
+    assert sel_env["run"] == []
+    assert any("선택했습니다" in t for _c, t in sel_env["send"])

@@ -1857,14 +1857,13 @@ def _selftest() -> None:
     assert len(_kb["inline_keyboard"]) == 2  # 2개씩 → [a,b][c]
     assert _kb["inline_keyboard"][0][0]["callback_data"] == "p:a"
     # 표시 라벨: 등록 폴더는 한글, 미등록은 humanize(라우팅 data 는 폴더명 유지).
-    # PROJECT_LABELS 는 _Core/project_labels.json 단일 소스에서 로드됨.
-    assert PROJECT_LABELS.get("trading_info") == "주식 모니터링"  # JSON 로드 확인
+    # 라벨: 로더 방어 + project_label 로직(파일 비의존 — 등록 키 검증은 pytest monkeypatch 몫).
     assert load_project_labels(PROJECT_DIR / "nope_no_file.json") == {}  # 파일 없음 방어
-    assert project_label("trading_info") == "주식 모니터링"
-    assert project_label("some_new_proj") == "some new proj"
+    assert project_label("some_new_proj") == "some new proj"  # 미등록→humanize
     assert project_label("") == "" and project_label("__") == "__"
-    _lk = project_keyboard(["trading_info"])["inline_keyboard"][0][0]
-    assert _lk["text"] == "주식 모니터링" and _lk["callback_data"] == "p:trading_info"
+    # 버튼 text=project_label·data=p:폴더명(라우팅 불변). 파일 비의존 구조 검증.
+    _lk = project_keyboard(["new_x"])["inline_keyboard"][0][0]
+    assert _lk["text"] == project_label("new_x") and _lk["callback_data"] == "p:new_x"
     assert all(
         len(btn["callback_data"].encode("utf-8")) <= 64
         for row in project_keyboard(["x" * 100])["inline_keyboard"]

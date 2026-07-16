@@ -717,15 +717,19 @@ def test_project_keyboard_empty_no_buttons():
     assert project_keyboard([]) == {"inline_keyboard": []}
 
 
-def test_project_keyboard_callback_data_prefix():
-    kb = project_keyboard(["etf_info"])
+def test_project_keyboard_callback_data_prefix(monkeypatch):
+    # 프로덕션 JSON 비의존 — 테스트용 라벨 dict 주입으로 로직만 검증(등록 키→라벨, data=폴더명).
+    monkeypatch.setattr(bridge, "PROJECT_LABELS", {"demo_proj": "데모 라벨"})
+    kb = project_keyboard(["demo_proj"])
     btn = kb["inline_keyboard"][0][0]
-    assert btn["text"] == "ETF 시뮬레이터"  # 표시는 한글 라벨
-    assert btn["callback_data"] == "p:etf_info"  # 라우팅은 폴더명 그대로
+    assert btn["text"] == "데모 라벨"  # 표시는 등록 라벨
+    assert btn["callback_data"] == "p:demo_proj"  # 라우팅은 폴더명 그대로
 
 
-def test_project_label_registered_and_humanize():
-    assert project_label("trading_info") == "주식 모니터링"  # 등록 라벨(JSON 로드)
+def test_project_label_registered_and_humanize(monkeypatch):
+    # 파일 로드 결과가 아니라 project_label 로직을 검증(등록 키→그 라벨 / 미등록→humanize).
+    monkeypatch.setattr(bridge, "PROJECT_LABELS", {"demo_proj": "데모 라벨"})
+    assert project_label("demo_proj") == "데모 라벨"  # 등록 라벨
     assert project_label("some_new_proj") == "some new proj"  # 미등록 → humanize
     assert project_label("a-b_c") == "a b c"
     assert project_label("") == ""  # 빈 값 안전
@@ -2221,12 +2225,15 @@ def test_selection_isolated_per_chat(sel_env, tmp_path):
     assert 888 not in bridge.chat_selection
 
 
-def test_bare_project_name_pins_selection_without_running(sel_env, tmp_path):
-    # 프로젝트명만 보내면(작업 없음) 선택만 고정하고 안내(실행 없음)
+def test_bare_project_name_pins_selection_without_running(sel_env, monkeypatch, tmp_path):
+    # 프로젝트명만 보내면(작업 없음) 선택만 고정하고 안내(실행 없음). 프로덕션 JSON 비의존.
+    monkeypatch.setattr(bridge, "PROJECT_LABELS", {"trading_info": "데모 라벨"})
     (tmp_path / "trading_info").mkdir()
     root = str(tmp_path)
     handle_update(_sel_msg(777, "trading_info"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
     assert bridge.chat_selection[777] == "trading_info"
     assert sel_env["run"] == []
-    # 안내에 한글 라벨 + 폴더명이 함께 노출("주식 모니터링(trading_info) 선택 —").
-    assert any("주식 모니터링" in t and "선택" in t for _c, t in sel_env["send"])
+    # 안내에 라벨 + 폴더명이 함께 노출("데모 라벨(trading_info) 선택 —").
+    assert any(
+        "데모 라벨" in t and "trading_info" in t and "선택" in t for _c, t in sel_env["send"]
+    )

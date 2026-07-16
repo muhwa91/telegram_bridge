@@ -11,6 +11,7 @@
 bridge.py 가 병렬 구현 중이라 임포트가 실패할 수 있으나, 파일 작성이 산출물이다.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from bridge import (
     handle_update,
     is_allowed,
     load_notify_state,
+    load_project_labels,
     load_schedules,
     mask_secrets,
     notify_keyboard,
@@ -45,6 +47,7 @@ from bridge import (
     parse_message,
     parse_stock_response,
     project_keyboard,
+    project_label,
     push_keyboard,
     resolve_project,
     resolve_target,
@@ -143,6 +146,35 @@ def test_push_word_casefold_matches_uppercase():
         assert variant.casefold() in bridge.PUSH_WORDS
 
 
+def _fold(s):
+    # handle_update 의 push 판정 표현식 미러 — 내부 공백 접고 casefold.
+    return "".join(s.split()).casefold()
+
+
+def test_push_word_inner_space_folded():
+    # #2: 내부 공백을 접어 판정 → "푸시 해줘"·"푸시 해"·"Push "도 push(PUSH_WORDS 는 붙여쓰기 유지).
+    for variant in ("푸시 해줘", "푸시 해", "푸 시", "PUSH  "):
+        assert _fold(variant) in bridge.PUSH_WORDS
+    # 문장은 여전히 push 아님(오탐 방지 계약 유지).
+    assert _fold("기록해주고 푸시해줘") not in bridge.PUSH_WORDS
+
+
+def test_push_inner_space_routes_to_do_push(monkeypatch, tmp_path):
+    # #2 배선: "푸시 해줘"(중간 공백)가 handle_update 에서 do_push 로 라우팅되는지.
+    calls = {"push": [], "send": []}
+
+    def fake_push(root):
+        calls["push"].append(root)
+        return bridge.HEADER_DONE
+
+    monkeypatch.setattr(bridge, "do_push", fake_push)
+    monkeypatch.setattr(bridge, "send_message", lambda *a, **_k: calls["send"].append(a))
+    handle_update(
+        _text_upd(777, "푸시 해줘"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
+    )
+    assert len(calls["push"]) == 1  # do_push 호출됨
+
+
 # ---------------------------------------------------------------------------
 # is_allowed(chat_id, allowed)
 # ---------------------------------------------------------------------------
@@ -175,11 +207,20 @@ def test_resolve_project_exact_match_success(tmp_path):
     assert Path(result).is_dir()
 
 
-def test_resolve_project_case_mismatch_rejected(tmp_path):
-    # Windows 파일시스템은 대소문자 무시라, 정확 일치는 listdir 문자열 비교여야 함.
-    # 나이브한 os.path.isdir(join(root, name)) 구현이면 이 테스트가 잡아낸다.
+def test_resolve_project_case_insensitive_unique_fallback(tmp_path):
+    # #1: 폰 첫 글자 자동 대문자화("Trading_Info") → 대소문자 무시 유일 일치면 실폴더로 해석.
+    # 반환은 사용자가 친 대문자가 아니라 실제 폴더명(trading_info)이어야 한다(오해·오탐 방지).
     (tmp_path / "trading_info").mkdir()
-    assert resolve_project("Trading_Info", str(tmp_path)) is None
+    result = resolve_project("Trading_Info", str(tmp_path))
+    assert result is not None
+    assert Path(result).name == "trading_info"  # 실폴더명으로 구성
+    assert Path(result).is_dir()
+
+
+def test_resolve_project_exact_match_precedence(tmp_path):
+    # #1: 정확 일치는 폴백보다 우선 — 정확히 친 이름은 그대로 해석.
+    (tmp_path / "logs").mkdir()
+    assert resolve_project("logs", str(tmp_path)) == str(tmp_path / "logs")
 
 
 def test_resolve_project_partial_match_rejected(tmp_path):
@@ -619,6 +660,54 @@ def test_do_push_success(monkeypatch):
     assert result.startswith(bridge.HEADER_DONE)
 
 
+def test_do_push_pull_uses_autostash(monkeypatch):
+    # A: pull --rebase 에 --autostash 가 포함돼야(미커밋 WIP 있어도 push 안 막히게).
+    seen = []
+
+    def spy(_root, *args):
+        seen.append(args)
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr(bridge, "_git", spy)
+    bridge.do_push(Path())
+    pull = next(a for a in seen if a[0] == "pull")
+    assert "--autostash" in pull
+
+
+def test_do_push_autostash_pop_conflict_isolates_and_warns(monkeypatch):
+    # #1: autostash pop 충돌(rebase rc==0, ls-files -u 비어있지 않음) → reset --hard 로
+    # 작업트리 복원 후 push 성공, 회신에 stash 경고. push "성공" 오보 + 충돌마커 잔류 회귀 방지.
+    seen = []
+
+    def spy(_root, *args):
+        seen.append(args)
+        if args[:2] == ("ls-files", "-u"):
+            return subprocess.CompletedProcess(["git", *args], 0, "100644 abc 1\tfile\n", "")
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr(bridge, "_git", spy)
+    result = bridge.do_push(Path())
+    assert result.startswith(bridge.HEADER_DONE)  # 커밋은 정상이라 push 는 진행
+    assert "stash" in result and "⚠️" in result  # 경고 명시
+    assert ("reset", "--hard", "HEAD") in seen  # 작업트리 복원(충돌마커 제거)
+    assert any(a[0] == "push" for a in seen)  # push 실제 수행
+
+
+def test_do_push_no_pop_conflict_no_warning(monkeypatch):
+    # #1 회귀: pop 충돌 없으면(ls-files -u 비어있음) reset 없이 조용히 push 성공.
+    seen = []
+
+    def spy(_root, *args):
+        seen.append(args)
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr(bridge, "_git", spy)
+    result = bridge.do_push(Path())
+    assert result.startswith(bridge.HEADER_DONE)
+    assert "stash" not in result and "⚠️" not in result
+    assert ("reset", "--hard", "HEAD") not in seen
+
+
 # ---------------------------------------------------------------------------
 # project_keyboard / push_keyboard / parse_callback: 인라인 키보드 (순수 함수)
 # ---------------------------------------------------------------------------
@@ -631,8 +720,59 @@ def test_project_keyboard_empty_no_buttons():
 def test_project_keyboard_callback_data_prefix():
     kb = project_keyboard(["etf_info"])
     btn = kb["inline_keyboard"][0][0]
-    assert btn["text"] == "etf_info"
-    assert btn["callback_data"] == "p:etf_info"
+    assert btn["text"] == "ETF 시뮬레이터"  # 표시는 한글 라벨
+    assert btn["callback_data"] == "p:etf_info"  # 라우팅은 폴더명 그대로
+
+
+def test_project_label_registered_and_humanize():
+    assert project_label("trading_info") == "주식 모니터링"  # 등록 라벨(JSON 로드)
+    assert project_label("some_new_proj") == "some new proj"  # 미등록 → humanize
+    assert project_label("a-b_c") == "a b c"
+    assert project_label("") == ""  # 빈 값 안전
+    assert project_label("__") == "__"  # 구분자만 → 원문 폴백(빈 결과 방지)
+
+
+def test_load_project_labels_normal(tmp_path):
+    p = tmp_path / "project_labels.json"
+    p.write_text('{"labels": {"trading_info": "주식 모니터링", "x": "엑스"}}', encoding="utf-8")
+    assert load_project_labels(p) == {"trading_info": "주식 모니터링", "x": "엑스"}
+
+
+def test_load_project_labels_missing_file_empty(tmp_path):
+    assert load_project_labels(tmp_path / "nope.json") == {}
+
+
+def test_load_project_labels_corrupt_empty(tmp_path):
+    p = tmp_path / "project_labels.json"
+    p.write_text("{ not json", encoding="utf-8")
+    assert load_project_labels(p) == {}
+
+
+def test_load_project_labels_no_labels_key_empty(tmp_path):
+    p = tmp_path / "project_labels.json"
+    p.write_text('{"other": {"a": "b"}}', encoding="utf-8")
+    assert load_project_labels(p) == {}
+
+
+def test_load_project_labels_drops_non_str_values(tmp_path):
+    # 값이 문자열 아닌 항목은 제거(형식 방어).
+    p = tmp_path / "project_labels.json"
+    p.write_text('{"labels": {"ok": "라벨", "bad": 123, "list": ["x"]}}', encoding="utf-8")
+    assert load_project_labels(p) == {"ok": "라벨"}
+
+
+def test_load_project_labels_bom_absorbed(tmp_path):
+    # #2: BOM(utf-8-sig) 포함 파일도 크래시 없이 정상 파싱(SSOT 깨짐 방지).
+    p = tmp_path / "project_labels.json"
+    p.write_text('{"labels": {"trading_info": "주식 모니터링"}}', encoding="utf-8-sig")
+    assert load_project_labels(p) == {"trading_info": "주식 모니터링"}
+
+
+def test_load_project_labels_cp949_falls_back_empty(tmp_path):
+    # #2: 비-UTF8(cp949) 파일 → UnicodeDecodeError(ValueError 계열) 포착 → 크래시 없이 {}.
+    p = tmp_path / "project_labels.json"
+    p.write_bytes('{"labels": {"x": "한글"}}'.encode("cp949"))
+    assert load_project_labels(p) == {}
 
 
 def test_project_keyboard_two_per_row():
@@ -1156,7 +1296,8 @@ def test_dispatch_no_targets_no_send(notify_env, monkeypatch):
     assert notify_env["save"] == []
 
 
-def test_callback_nb_ok_edits_and_clears_snooze(notify_env, tmp_path):
+def test_callback_nb_ok_edits_and_clears_snooze(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [])  # 프로덕션 notify.json 비의존(항목 없음 폴백)
     bridge.notify_snooze["a"] = "2026-07-15T09:00:00+09:00"
     handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
     assert notify_env["edit"][0][2].startswith("✅")  # 확인 접수·버튼 제거
@@ -1164,7 +1305,8 @@ def test_callback_nb_ok_edits_and_clears_snooze(notify_env, tmp_path):
     assert len(notify_env["save"]) == 1  # 스누즈 변화 → save
 
 
-def test_callback_nb_ok_without_snooze_no_save(notify_env, tmp_path):
+def test_callback_nb_ok_without_snooze_no_save(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [])  # 프로덕션 notify.json 비의존
     handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
     assert notify_env["edit"][0][2].startswith("✅")
     assert notify_env["save"] == []  # 변화 없으면 불필요한 IO 없음
@@ -1184,6 +1326,73 @@ def test_callback_nb_disallowed_chat_ignored(notify_env, tmp_path):
     assert notify_env["edit"] == []
     assert notify_env["save"] == []
     assert bridge.notify_snooze == {}
+
+
+# --- nb:ok = 실제 예약 점검 실행 (build_notify_check_prompt · 항목 조회 라우팅) ---
+
+
+def test_build_notify_check_prompt_contents():
+    p = bridge.build_notify_check_prompt("코스피 개장", "야간선물→코스피 전환 확인")
+    assert "코스피 개장" in p and "야간선물→코스피 전환 확인" in p
+    assert "점검" in p and "제안" in p  # 점검·제안(자동수정 금지)
+    assert "수정·커밋은 하지 마라" in p  # 안전핀
+
+
+def _write_schedules(monkeypatch, tmp_path, items):
+    p = tmp_path / "notify.json"
+    p.write_text(json.dumps({"items": items}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(bridge, "SCHEDULES_FILE", p)
+
+
+def test_callback_nb_ok_runs_check_when_item_found(notify_env, monkeypatch, tmp_path):
+    # 항목 있음 + 프로젝트 해석됨 → run_claude_with_progress 실행(점검 프롬프트·해석된 경로).
+    (tmp_path / "trading_info").mkdir()
+    _write_schedules(
+        monkeypatch,
+        tmp_path,
+        [{"id": "a", "project": "trading_info", "note": "개장 확인", "label": "코스피 개장"}],
+    )
+    runs = []
+
+    def spy(_t, cid, _hdr, _exe, proj, task, _to, _sec, allowed_tools=None, **_k):
+        runs.append((cid, proj, task, allowed_tools))
+
+    monkeypatch.setattr(bridge, "run_claude_with_progress", spy)
+    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert len(runs) == 1
+    cid, proj, task, allowed_tools = runs[0]
+    assert cid == 777 and proj == str(tmp_path / "trading_info")
+    assert "코스피 개장" in task and "개장 확인" in task  # 점검 프롬프트
+    # 읽기/검증 전용 도구셋 하드 강제: Read 포함, Edit/Write/commit 미포함.
+    assert allowed_tools == bridge.NOTIFY_CHECK_TOOLS
+    assert "Read" in allowed_tools
+    assert "Edit" not in allowed_tools and "Write" not in allowed_tools
+    assert not any("commit" in t for t in allowed_tools)
+    assert any("확인 실행 중" in t for _c, _m, t in notify_env["edit"])
+
+
+def test_callback_nb_ok_project_unresolved_errors(notify_env, monkeypatch, tmp_path):
+    # 항목 있음 + 프로젝트 폴더 없음 → 실행 안 함·에러 안내.
+    _write_schedules(
+        monkeypatch, tmp_path, [{"id": "a", "project": "gone_proj", "note": "확인", "label": "L"}]
+    )
+    runs = []
+    monkeypatch.setattr(
+        bridge, "run_claude_with_progress", lambda *_a, **_k: runs.append(1)
+    )
+    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert runs == []  # 실행 안 됨
+    assert any("찾지 못해" in t for _c, _m, t in notify_env["edit"])
+
+
+def test_callback_nb_ok_no_item_falls_back(notify_env, monkeypatch, tmp_path):
+    # 매칭 항목 없음 → 구 stub 접수 문구 폴백(실행 없음).
+    _write_schedules(monkeypatch, tmp_path, [{"id": "other", "project": "x", "note": "n"}])
+    runs = []
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: runs.append(1))
+    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    assert runs == []
+    assert any("확인을 시작합니다" in t for _c, _m, t in notify_env["edit"])
 
 
 # ===========================================================================
@@ -1686,6 +1895,27 @@ def test_await_reply_cancel_clears(choice_env):
     assert any("취소" in t for _c, t in choice_env["send"])
 
 
+def test_await_reply_slash_command_falls_through(choice_env, tmp_path):
+    # #3: 직접입력 대기 중 슬래시 명령(/projects)은 답으로 삼키지 않고 정상 명령 처리로 폴백.
+    (tmp_path / "etf_info").mkdir()
+    bridge.pending[50] = _pending_entry(await_reply=True)
+    handle_update(
+        _text_upd(777, "/projects"), "T", _ALLOWED, "claude", tmp_path, str(tmp_path), 60, []
+    )
+    assert choice_env["resume"] == []  # 명령이 resume 답으로 삼켜지지 않음
+    assert any("대상 프로젝트" in t for _c, t in choice_env["send"])  # /projects 정상 처리
+    assert 50 in bridge.pending  # 대기는 소비되지 않고 유지(명령이라 답이 아님)
+
+
+def test_await_reply_non_slash_still_routes_to_resume(choice_env):
+    # #3 회귀: 슬래시 아닌 텍스트(push 별칭 포함)는 여전히 답으로 라우팅(슬래시만 예외).
+    bridge.pending[50] = _pending_entry(await_reply=True)
+    handle_update(_text_upd(777, "push"), "T", _ALLOWED, "claude", Path(), "root", 60, [])
+    assert len(choice_env["resume"]) == 1  # push 별칭도 대기 중엔 유효한 답
+    assert choice_env["resume"][0]["answer"] == "push"
+    assert 50 not in bridge.pending  # 소비
+
+
 # --- M-1: pending chat_id 격리 (타 chat 세션 탈취 방지) ---
 
 _ALLOWED2 = frozenset({777, 888})
@@ -1812,6 +2042,101 @@ def test_rcwp_full_path_renders_and_hides_marker(monkeypatch):
     bridge.pending.clear()
 
 
+def test_rcwp_choice_sets_choice_rendered_flag(monkeypatch):
+    # #4: 선택지 감지 시 반환 data 에 choice_rendered 플래그가 서야(git 노트 스킵 신호).
+    bridge.pending.clear()
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {
+            "result": "고르세요\n❓선택: [유지|keep]|[교체|swap]",
+            "is_error": False,
+            "session_id": "sid-1",
+        },
+    )
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 10)
+    monkeypatch.setattr(bridge, "edit_message", lambda *_a: None)
+    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "edit_message_reply_markup", lambda *_a: None)
+    data = bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [])
+    assert data.get("choice_rendered") is True
+    bridge.pending.clear()
+
+
+def test_rcwp_no_choice_no_flag(monkeypatch):
+    # #4 회귀: 선택지 없는 실행엔 choice_rendered 가 서지 않음(git 노트 정상 발송 유지).
+    bridge.pending.clear()
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"result": "끝", "is_error": False, "session_id": "s"},
+    )
+    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 10)
+    monkeypatch.setattr(bridge, "edit_message", lambda *_a: None)
+    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
+    data = bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [])
+    assert not data.get("choice_rendered")
+    bridge.pending.clear()
+
+
+def test_handle_update_skips_git_note_when_choice_rendered(monkeypatch, tmp_path):
+    # #4 배선: choice_rendered 실행에선 handle_update 가 git '변경 없음' 노트를 건너뛴다.
+    (tmp_path / "etf_info").mkdir()
+    bridge.chat_selection.clear()
+    sent = []
+    monkeypatch.setattr(
+        bridge,
+        "run_claude_with_progress",
+        lambda *_a, **_k: {"is_error": False, "result": "ok", "choice_rendered": True},
+    )
+    monkeypatch.setattr(
+        bridge, "send_message", lambda _t, _c, text, _s, _rm=None: sent.append(text)
+    )
+    note_calls = []
+    monkeypatch.setattr(bridge, "git_status_note", lambda _r: note_calls.append(1) or "변경 없음.")
+    monkeypatch.setattr(bridge, "git_ahead", lambda _r: 0)
+    handle_update(
+        _text_upd(777, "etf_info 뭐 골라줘"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
+    )
+    assert note_calls == []  # git 상태 조회 자체를 건너뜀
+    assert all(bridge.HEADER_NOTE not in t for t in sent)  # 노트 미발송
+    bridge.chat_selection.clear()
+
+
+def _git_note_env(monkeypatch, tmp_path, ahead):
+    """정상 작업 1건 실행 후 git 노트 전송 여부 검증용 스파이(ahead 값 고정)."""
+    (tmp_path / "etf_info").mkdir()
+    bridge.chat_selection.clear()
+    sent = []
+    monkeypatch.setattr(
+        bridge,
+        "run_claude_with_progress",
+        lambda *_a, **_k: {"is_error": False, "result": "ok"},
+    )
+    monkeypatch.setattr(
+        bridge, "send_message", lambda _t, _c, text, _s, _rm=None: sent.append(text)
+    )
+    monkeypatch.setattr(bridge, "git_ahead", lambda _r: ahead)
+    monkeypatch.setattr(bridge, "git_status_note", lambda _r: f"로컬 커밋 {ahead}개 대기 — ...")
+    handle_update(
+        _text_upd(777, "etf_info 로그 봐줘"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
+    )
+    bridge.chat_selection.clear()
+    return sent
+
+
+def test_handle_update_skips_note_when_no_ahead(monkeypatch, tmp_path):
+    # B: ahead==0(dirty 여부 무관)이면 git 노트를 아예 보내지 않는다(데스크탑 WIP 잡음 제거).
+    sent = _git_note_env(monkeypatch, tmp_path, ahead=0)
+    assert all(bridge.HEADER_NOTE not in t for t in sent)
+
+
+def test_handle_update_sends_note_when_ahead(monkeypatch, tmp_path):
+    # B: ahead>0(올릴 로컬 커밋 있음)일 때만 노트를 push 버튼과 함께 보낸다.
+    sent = _git_note_env(monkeypatch, tmp_path, ahead=2)
+    assert any(bridge.HEADER_NOTE in t for t in sent)
+
+
 # ===========================================================================
 # ④ chat 프로젝트 선택 고정 — 버튼 탭 → 프로젝트명 생략 실행 · 명시 우선 갱신 · chat 격리.
 #   handle_callback(p:) / handle_update 배선. run_claude_with_progress·git 스파이.
@@ -1903,4 +2228,5 @@ def test_bare_project_name_pins_selection_without_running(sel_env, tmp_path):
     handle_update(_sel_msg(777, "trading_info"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
     assert bridge.chat_selection[777] == "trading_info"
     assert sel_env["run"] == []
-    assert any("선택했습니다" in t for _c, t in sel_env["send"])
+    # 안내에 한글 라벨 + 폴더명이 함께 노출("주식 모니터링(trading_info) 선택 —").
+    assert any("주식 모니터링" in t and "선택" in t for _c, t in sel_env["send"])

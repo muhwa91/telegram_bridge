@@ -1,4 +1,4 @@
-# telegram_bridge
+# claude_bridge
 
 **폰에서 보낸 한 줄로 노트북의 Claude Code 를 원격 실행하는 ChatOps 브리지.**
 PC 앞에 없어도 텔레그램에 `<프로젝트> <지시>` 를 보내면 상시 켜 둔 노트북이 대신
@@ -27,7 +27,7 @@ graph LR
 ## Quick Start
 
 ```bash
-git clone <repo> && cd telegram_bridge
+git clone <repo> && cd claude_bridge
 cp .env.example .env          # TG_BOT_TOKEN · TG_ALLOWED_CHAT_IDS 채우기
 python bridge.py              # 또는 run.bat — 폰에서 /help 로 시작
 ```

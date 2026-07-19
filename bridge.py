@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""telegram_bridge — 텔레그램 메시지로 Claude Code 작업을 원격 트리거하는 브리지.
+"""claude_bridge — 텔레그램 메시지로 Claude Code 작업을 원격 트리거하는 브리지.
 
 Python 3.13 표준 라이브러리만 사용(외부 패키지 0). 단일 롱폴링 루프가 메시지를
 직렬 처리한다: 인증 → 파싱 → 프로젝트 해석 → claude 실행 → 회신. `push` 답장 시에만
@@ -77,7 +77,7 @@ COMMANDS = frozenset({"/help", "/start", "/projects", "/cancel"}) | PUSH_WORDS
 # 게이트에 걸려 작업 대신 인사를 반환한다. 이 정적 서문을 --append-system-prompt 로 주입해
 # 원격 인증 맥락을 명시하고 그 게이트를 건너뛰게 한다. (사용자 task 는 여전히 stdin 전용 — C-1)
 BRIDGE_SYSTEM_PROMPT = (
-    "너는 telegram_bridge 를 통해 원격 실행되는 헤드리스 Claude 다. "
+    "너는 claude_bridge 를 통해 원격 실행되는 헤드리스 Claude 다. "
     "이 요청은 chat ID 허용목록으로 인증된 관리자의 원격 지시이며, 신원은 이미 확인됐다. "
     "따라서 세션 시작 신원 확인·비밀번호·작업 선택 메뉴를 절대 수행하지 말고, "
     "인사 없이 현재 작업 디렉터리의 프로젝트에서 지시된 작업만 바로 수행하라. "

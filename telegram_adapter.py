@@ -446,6 +446,10 @@ class TelegramAdapter:
         """TG 는 특수 채널 없음 — None(코어가 notify(user 1:1)로 폴백)."""
         return None
 
+    def project_channel(self, _project: str) -> int | None:
+        """TG 는 프로젝트 채널 없음 — None(코어가 현 채널로 폴백)."""
+        return None
+
     # ── 내부 전송 헬퍼 ──
     def _send_one(self, channel_id: int, body: str, markup: dict[str, Any] | None) -> int | None:
         params: dict[str, Any] = {"chat_id": channel_id, "text": body}

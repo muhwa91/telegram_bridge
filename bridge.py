@@ -1286,13 +1286,24 @@ def _handle_button(
         item = next((it for it in load_schedules(SCHEDULES_FILE) if it.get("id") == arg), None)
         note = str(item.get("note", "")) if item else ""
         label = str(item.get("label", arg)) if item else arg
-        proj_path = resolve_project(str(item.get("project", "")), target_root) if item else None
+        proj_name = str(item.get("project", "")) if item else ""
+        proj_path = resolve_project(proj_name, target_root) if item else None
         if item is not None and note and proj_path is not None:
+            # #알림 채널이 실행 로그로 지저분해지지 않게, 실제 점검은 프로젝트 채널로 스트리밍한다.
+            # 프로젝트 채널이 없으면(TG·미매핑) 현 채널로 폴백(회귀 없음).
+            exec_ch = adapter.project_channel(proj_name)
             if isinstance(message_id, int):
-                adapter.edit(channel_id, message_id, f"✅ 「{label}」 확인 실행 중…")
+                if exec_ch is not None and exec_ch != channel_id:
+                    adapter.edit(
+                        channel_id,
+                        message_id,
+                        f"✅ 「{label}」 확인 시작 — 프로젝트 채널에서 실행합니다.",
+                    )
+                else:
+                    adapter.edit(channel_id, message_id, f"✅ 「{label}」 확인 실행 중…")
             run_claude_with_progress(
                 adapter,
-                channel_id,
+                exec_ch or channel_id,
                 f"{LEAD_CHECK} {label} 확인 중…",
                 claude_exe,
                 proj_path,

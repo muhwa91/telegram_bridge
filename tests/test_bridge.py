@@ -68,7 +68,7 @@ _ALLOWED2 = frozenset({777, 888})
 class FakeAdapter:
     """Adapter 계약(secrets·poll·send·edit·ack·fetch_file·close) 구현 — 호출 기록용 테스트 더블."""
 
-    def __init__(self, secrets=None, send_ids=None, fetch=None, roles=None):
+    def __init__(self, secrets=None, send_ids=None, fetch=None, roles=None, projects=None):
         self.secrets = secrets if secrets is not None else []
         self.sent = []  # (channel_id, text, buttons)
         self.notified = []  # (user_id, text, buttons) — H-1 알림 발송 타겟
@@ -79,6 +79,7 @@ class FakeAdapter:
         self.runs = []  # run_claude_with_progress 스파이용(테스트가 채움)
         self.setup_names = None  # setup_channels 스파이
         self._roles = roles or {}  # role -> channel_id(#알림·#봇상태 라우팅)
+        self._projects = projects or {}  # 프로젝트명 -> channel_id(예약 확인 실행 라우팅)
         self._send_ids = iter(send_ids) if send_ids is not None else None
         self._fetch = fetch
 
@@ -119,6 +120,9 @@ class FakeAdapter:
 
     def role_channel(self, role):
         return self._roles.get(role)
+
+    def project_channel(self, project):
+        return self._projects.get(project)
 
 
 def _btn(user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_id=None):
@@ -1813,7 +1817,27 @@ def test_button_nb_ok_runs_check_when_item_found(notify_env, monkeypatch, tmp_pa
     assert "Read" in allowed_tools
     assert "Edit" not in allowed_tools and "Write" not in allowed_tools
     assert not any("commit" in t for t in allowed_tools)
+    # 프로젝트 채널 미매핑(폴백) — 실행은 #알림(=버튼 채널 777)으로, 문구는 기존 "확인 실행 중".
+    assert cid == 777
     assert any("확인 실행 중" in t for _c, _m, t, _b in notify_env.edited)
+
+
+def test_button_nb_ok_runs_check_in_project_channel_when_mapped(notify_env, monkeypatch, tmp_path):
+    # #알림에서 확인시작 → 실제 점검은 프로젝트 채널로 스트리밍(#알림 지저분 방지).
+    (tmp_path / "trading_info").mkdir()
+    _write_schedules(
+        monkeypatch,
+        tmp_path,
+        [{"id": "a", "project": "trading_info", "note": "개장 확인", "label": "코스피 개장"}],
+    )
+    notify_env._projects = {"trading_info": 5000}  # #trading_info 프로젝트 채널
+    runs = []
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *a, **_k: runs.append(a[1]))
+    # 버튼은 #알림(777)에서 눌림.
+    _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    # 실행은 프로젝트 채널ID(5000)로, #알림 버튼은 "프로젝트 채널에서 실행" 문구로 edit.
+    assert runs == [5000]
+    assert any(c == 777 and "프로젝트 채널에서 실행" in t for c, _m, t, _b in notify_env.edited)
 
 
 def test_button_nb_ok_project_unresolved_errors(notify_env, monkeypatch, tmp_path):

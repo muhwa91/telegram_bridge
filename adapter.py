@@ -110,6 +110,14 @@ class Adapter(Protocol):
         """
         ...
 
+    def project_channel(self, project: str) -> int | None:
+        """프로젝트 폴더명 → 그 프로젝트 채널 channelID. role_channel 과 대칭(kind="project").
+
+        예약 확인 실행이 #알림이 아닌 프로젝트 채널로 스트리밍되도록 라우팅에 쓴다.
+        DC = channel_map 역조회, TG = None(채널 없음 → 코어가 현 채널 폴백).
+        """
+        ...
+
 
 # ── 플랫폼 무관 공유 유틸 ──────────────────────────────────────────────────
 # 코어·모든 어댑터가 공유하므로 순환 import 를 피해 이 shared base 에 둔다(bridge 는

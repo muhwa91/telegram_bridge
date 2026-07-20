@@ -648,6 +648,14 @@ def test_role_channel_reverse_lookup():
     assert a.role_channel("없는역할") is None
 
 
+def test_project_channel_reverse_lookup():
+    a = _adapter()
+    a._channel_map = {10: ("role", "알림"), 20: ("project", "etf_info")}
+    assert a.project_channel("etf_info") == 20  # 히트
+    assert a.project_channel("알림") is None  # role 태그는 매칭 안 됨
+    assert a.project_channel("없는프로젝트") is None  # 미스
+
+
 def test_setup_channels_stores_names():
     a = _adapter()
     a.setup_channels(["a", "b"])

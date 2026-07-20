@@ -318,6 +318,13 @@ class DiscordAdapter:
                 return cid
         return None
 
+    def project_channel(self, project: str) -> int | None:
+        """프로젝트 폴더명 → 프로젝트 채널 channelID(channel_map 역조회). 없으면 None."""
+        for cid, (kind, tag) in self._channel_map.items():
+            if kind == "project" and tag == project:
+                return cid
+        return None
+
     async def _ensure_channels(self) -> None:
         """F1: on_ready 재진입 직렬화(재접속 중복생성 경쟁 차단) 후 실제 셋업. 셋업 경로 전용."""
         async with self._setup_lock:

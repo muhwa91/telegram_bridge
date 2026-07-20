@@ -19,9 +19,12 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI 로 렌더(TG inline_keyboard ↔ DC discord.ui.Button)."""
 
     label: str
-    action: str  # 정규화 액션: "push"|"x"|"p"|"c"|"nb:ok"|"nb:later"
-    arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx" 등)
-    style: str = "default"  # "default"|"primary"|"danger" — 어댑터가 플랫폼 색으로 매핑
+    # 정규화 액션: push|x|p|c|nb:ok|nb:later + §4.7 델타3(r|rec|fav|fav:add|fav:del).
+    action: str
+    arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
+    # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
+    # danger=파괴 전용(빨강)/secondary=그 외(회색). "default"는 secondary 동의어(하위호환).
+    style: str = "default"  # "default"|"secondary"|"primary"|"success"|"danger"
 
 
 @dataclass(frozen=True)
@@ -37,7 +40,13 @@ class Event:
     action_arg: str = ""  # 버튼 인자
     callback_id: str | None = None  # ack 핸들 (callback_query_id ↔ interaction 토큰)
     photo_ref: str | None = None  # 파일 핸들 (file_id ↔ attachment.url)
-    project: str | None = None  # DC 는 채널→프로젝트를 어댑터가 미리 채움. TG 는 None
+    project: str | None = None  # DC 는 채널→프로젝트(channel_map)를 어댑터가 미리 채움. TG 는 None
+    # §4.7 델타2: 답장 이어가기(④). TG=reply_to_message.message_id / DC=message.reference.msg_id.
+    # 1a 는 어댑터가 채우기만·코어 소비는 1c(frozen 기본값이라 기존 생성부는 무영향).
+    reply_to: int | None = None
+    # ①(채널 자동생성): 특수 채널 역할 태그("간단처리"|"데이터분석"|"알림"|"봇상태"). DC 어댑터가
+    # channel_map 으로 채운다. 프로젝트 채널은 project 로, 특수 채널은 이 필드로 라우팅. TG 는 None.
+    channel_role: str | None = None
 
 
 class Adapter(Protocol):
@@ -84,6 +93,21 @@ class Adapter(Protocol):
 
     def close(self) -> None:
         """연결 정리(DC Gateway 종료 / TG no-op). 중복 호출 무해."""
+        ...
+
+    def setup_channels(self, project_names: list[str]) -> None:
+        """①(채널 자동생성): 봇 기동 시 1회 카테고리·채널 구성(있으면 재사용). DC 전용, TG no-op.
+
+        project_names = 프로젝트 카테고리 채널 목록(코어 list_projects). 특수 채널(간단처리·데이터
+        분석·알림·봇상태) 구조는 어댑터가 안다. channelID→역할/폴더 매핑을 영속(channel_map.json).
+        """
+        ...
+
+    def role_channel(self, role: str) -> int | None:
+        """특수 채널 역할("알림"|"봇상태"|…) → channelID. DM 폐기로 알림·재시작완료가 여기로 간다.
+
+        DC = channel_map 역조회, TG = None(채널 없음 → 코어가 notify(1:1)로 폴백).
+        """
         ...
 
 

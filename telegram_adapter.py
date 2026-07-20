@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import logging
@@ -87,7 +88,38 @@ def parse_callback(data: str) -> tuple[str, str] | None:
         if sel_ok:
             return ("c", f"{parts[1]}:{parts[2]}")
         return None
+    # §4.7 델타3: 후속버튼(②)·매크로(③) 콜백. 전부 정수 arg(isascii+isdigit 재사용) — 라우팅은
+    # 1b·1e, 여기선 코덱만. 정확 매칭 밖은 None(폐기) 불변. 코어 _handle_button 은 미분기라
+    # "ack 후 무시"로 안전(1a 는 이 버튼들을 방출하지 않음 — 코덱만 준비).
+    if data.startswith("r:"):
+        # r:<mid> (재실행) | r:<mid>:go (확인 게이트 통과 실행). mid 정수, 접미는 정확히 'go'.
+        parts = data.split(":")
+        mid_ok = len(parts) in (2, 3) and _dig(parts[1])
+        if mid_ok and len(parts) == 2:
+            return ("r", parts[1])
+        if mid_ok and len(parts) == 3 and parts[2] == "go":
+            return ("r", f"{parts[1]}:go")
+        return None
+    if data.startswith("fav:"):
+        # fav:<idx> (실행) | fav:add:<idx> (등록) | fav:del:<idx> (삭제). idx 정수.
+        parts = data.split(":")
+        if len(parts) == 2 and _dig(parts[1]):
+            return ("fav", parts[1])
+        if len(parts) == 3 and parts[1] in ("add", "del") and _dig(parts[2]):
+            return (f"fav:{parts[1]}", parts[2])
+        return None
+    if data.startswith("rec:"):
+        # rec:<idx> — 최근 실행. idx 정수.
+        idx = data[len("rec:") :]
+        if _dig(idx):
+            return ("rec", idx)
+        return None
     return None
+
+
+def _dig(s: str) -> bool:
+    """정수 arg 안전 검사(§4.7 재사용): isascii()+isdigit() — 전각·위첨자 유니코드 숫자 차단."""
+    return s.isascii() and s.isdigit()
 
 
 def extract_photo(update: dict[str, Any]) -> str | None:
@@ -118,7 +150,8 @@ def encode_callback(action: str, arg: str) -> str:
     """
     if action in ("push", "x"):
         return action
-    if action in ("p", "nb:ok", "nb:later", "c"):
+    # 콜론-join 액션(§1.3 + §4.7 델타3): arg(id·mid·idx·"mid:idx"·"mid:go")를 그대로 이어붙인다.
+    if action in ("p", "nb:ok", "nb:later", "c", "r", "rec", "fav", "fav:add", "fav:del"):
         return f"{action}:{arg}"
     return action  # 방출측이 유효 액션만 넘기므로 폴백은 그대로
 
@@ -239,16 +272,19 @@ class TelegramAdapter:
         self.poll_timeout = poll_timeout
         self.limit = limit
         self._closed = False
+        # poll 진행 커서(인스턴스 보관). close() 가 flush 해, 재시작(exit)으로 yield-후 save 를
+        # 못 밟는 경우에도 재시작 메시지 재수신(무한 재시작 루프)을 막는다. 0 = 미폴링(안 건드림).
+        self._offset = 0
 
     # ── 수신: getUpdates 롱폴링 → 정규화 Event 제너레이터(§2.5) ──
     def poll(self) -> Iterator[Event]:
-        offset = load_offset(self.offset_file)
+        self._offset = load_offset(self.offset_file)
         while not self._closed:
             try:
                 resp = tg_call(
                     self.token,
                     "getUpdates",
-                    {"timeout": self.poll_timeout, "offset": offset},
+                    {"timeout": self.poll_timeout, "offset": self._offset},
                     timeout=self.poll_timeout + 10,
                 )
             except _NET_ERRORS as e:
@@ -263,10 +299,10 @@ class TelegramAdapter:
                 # D4: update_id 를 먼저 추출해 offset 을 선진행(포이즌 메시지 재수신 핫루프 방지).
                 uid = upd.get("update_id") if isinstance(upd, dict) else None
                 if isinstance(uid, int):
-                    offset = uid + 1
+                    self._offset = uid + 1
                 yield from self._to_events(upd)
                 try:
-                    save_offset(self.offset_file, offset)  # 처리 후 영속(§2.5)
+                    save_offset(self.offset_file, self._offset)  # 처리 후 영속(§2.5)
                 except OSError as e:
                     log.error("offset 저장 실패: %s", type(e).__name__)
 
@@ -291,6 +327,9 @@ class TelegramAdapter:
         if not isinstance(chat_id, int) or not isinstance(user_id, int):
             return
         mid = _int_or_none(msg.get("message_id"))
+        # §4.7 델타2: 답장 이어가기(④). reply_to_message.message_id 를 채운다(소비는 1c).
+        rt = msg.get("reply_to_message")
+        reply_to = _int_or_none(rt.get("message_id")) if isinstance(rt, dict) else None
         photo = msg.get("photo")
         if isinstance(photo, list) and photo:
             caption = msg.get("caption")
@@ -301,6 +340,7 @@ class TelegramAdapter:
                 text=caption if isinstance(caption, str) else "",
                 message_id=mid,
                 photo_ref=extract_photo(upd),
+                reply_to=reply_to,
             )
             return
         # 텍스트 없는 비지원 메시지(스티커 등)는 text="" 로 정규화 → 코어가 "텍스트만 처리" 회신.
@@ -311,6 +351,7 @@ class TelegramAdapter:
             user_id=user_id,
             text=text if isinstance(text, str) else "",
             message_id=mid,
+            reply_to=reply_to,
         )
 
     def _callback_event(self, cq: dict[str, Any]) -> Event | None:
@@ -342,10 +383,13 @@ class TelegramAdapter:
         """마스킹 후 청크 분할 전송. 버튼은 마지막 청크에만. 첫 청크 message_id 반환(실패 None)."""
         chunks = chunk_text(mask_secrets(text, self.secrets), self.limit)
         last = len(chunks) - 1
+        # 빈 본문 + 버튼(예: /projects) → TG 는 본문 필수라 중립 라벨(DC 는 V2 가 흡수). 버튼 없는
+        # 빈 응답만 기존 "(빈 응답)". 코어·DC 무영향(TG 어댑터 국소).
+        placeholder = "대상 프로젝트" if buttons is not None else "(빈 응답)"
         first_id: int | None = None
         for i, chunk in enumerate(chunks):
             markup = render_buttons(buttons) if buttons is not None and i == last else None
-            mid = self._send_one(channel_id, chunk or "(빈 응답)", markup)
+            mid = self._send_one(channel_id, chunk or placeholder, markup)
             if i == 0:
                 first_id = mid
         return first_id
@@ -389,6 +433,18 @@ class TelegramAdapter:
 
     def close(self) -> None:
         self._closed = True
+        # 재시작(exit)으로 poll 의 yield-후 save 를 못 밟았을 때도 커서를 flush — 재시작 메시지
+        # 재수신(무한 재시작 루프) 차단. 0(미폴링)이면 건드리지 않음(스테일 offset 리셋 방지).
+        if self._offset:
+            with contextlib.suppress(OSError):
+                save_offset(self.offset_file, self._offset)
+
+    def setup_channels(self, _project_names: list[str]) -> None:
+        """TG 는 채널 개념 없음(1:1) — no-op. 채널 자동생성은 DC 전용."""
+
+    def role_channel(self, _role: str) -> int | None:
+        """TG 는 특수 채널 없음 — None(코어가 notify(user 1:1)로 폴백)."""
+        return None
 
     # ── 내부 전송 헬퍼 ──
     def _send_one(self, channel_id: int, body: str, markup: dict[str, Any] | None) -> int | None:

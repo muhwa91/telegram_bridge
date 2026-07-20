@@ -68,7 +68,7 @@ _ALLOWED2 = frozenset({777, 888})
 class FakeAdapter:
     """Adapter 계약(secrets·poll·send·edit·ack·fetch_file·close) 구현 — 호출 기록용 테스트 더블."""
 
-    def __init__(self, secrets=None, send_ids=None, fetch=None):
+    def __init__(self, secrets=None, send_ids=None, fetch=None, roles=None):
         self.secrets = secrets if secrets is not None else []
         self.sent = []  # (channel_id, text, buttons)
         self.notified = []  # (user_id, text, buttons) — H-1 알림 발송 타겟
@@ -77,6 +77,8 @@ class FakeAdapter:
         self.fetched = []  # (photo_ref, dest_dir)
         self.saves = []  # dispatch/nb 상태 저장 스파이용(테스트가 채움)
         self.runs = []  # run_claude_with_progress 스파이용(테스트가 채움)
+        self.setup_names = None  # setup_channels 스파이
+        self._roles = roles or {}  # role -> channel_id(#알림·#봇상태 라우팅)
         self._send_ids = iter(send_ids) if send_ids is not None else None
         self._fetch = fetch
 
@@ -111,6 +113,12 @@ class FakeAdapter:
 
     def close(self):
         pass
+
+    def setup_channels(self, project_names):
+        self.setup_names = list(project_names)
+
+    def role_channel(self, role):
+        return self._roles.get(role)
 
 
 def _btn(user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_id=None):
@@ -799,11 +807,11 @@ def test_project_buttons_empty_renders_no_buttons():
 def test_project_buttons_action_arg_and_render(monkeypatch):
     monkeypatch.setattr(bridge, "PROJECT_LABELS", {"demo_proj": "데모 라벨"})
     btns = project_buttons(["demo_proj"])
-    assert btns[0] == Button("데모 라벨", "p", "demo_proj")
+    assert btns[0] == Button("📁 데모 라벨", "p", "demo_proj", style="primary")  # 📁+primary
     kb = render_buttons(btns)
     btn = kb["inline_keyboard"][0][0]
-    assert btn["text"] == "데모 라벨"  # 표시는 등록 라벨
-    assert btn["callback_data"] == "p:demo_proj"  # 라우팅은 폴더명 그대로
+    assert btn["text"] == "📁 데모 라벨"  # 📁 접두 + 등록 라벨
+    assert btn["callback_data"] == "p:demo_proj"  # 라우팅은 폴더명 그대로(스타일 무관)
 
 
 def test_project_label_registered_and_humanize(monkeypatch):
@@ -867,7 +875,7 @@ def test_render_buttons_callback_data_within_64_bytes():
     long_name = "가" * 100  # 3바이트 * 100 = 300바이트
     kb = render_buttons(project_buttons([long_name]))
     btn = kb["inline_keyboard"][0][0]
-    assert btn["text"] == long_name  # 표시는 전체
+    assert btn["text"] == f"📁 {long_name}"  # 📁 접두 + 전체 라벨
     assert len(btn["callback_data"].encode("utf-8")) <= 64
     assert btn["callback_data"].startswith("p:가")  # 부분 멀티바이트 안 깨짐
 
@@ -877,7 +885,14 @@ def test_push_buttons_structure():
     row = kb["inline_keyboard"][0]
     assert [b["callback_data"] for b in row] == ["push", "x"]
     assert row[0]["text"] == "✅ Push"
-    assert row[1]["text"] == "❌ 취소"
+    assert row[1]["text"] == "취소"  # §4.2: 취소는 secondary(❌=파괴 암시 제거)
+
+
+def test_push_buttons_styles_success_and_secondary():
+    # §4.7 델타1: Push=success(초록 승인 위계), 취소=secondary(danger 는 파괴 전용).
+    btns = push_buttons()
+    assert (btns[0].action, btns[0].style) == ("push", "success")
+    assert (btns[1].action, btns[1].style) == ("x", "secondary")
 
 
 def test_notify_buttons_callback_data():
@@ -987,7 +1002,7 @@ def test_parse_callback_choice_rejects_unicode_digits():
 
 
 def test_encode_callback_is_inverse_of_parse():
-    # §1.3 7종: encode(디코드 결과) == 원 문자열(무손실 왕복).
+    # §1.3 7종 + §4.7 델타3: encode(디코드 결과) == 원 문자열(무손실 왕복).
     for data in (
         "push",
         "x",
@@ -996,10 +1011,286 @@ def test_encode_callback_is_inverse_of_parse():
         "nb:later:ti-roll",
         "c:55:1",
         "c:55:other",
+        "r:42",
+        "r:42:go",
+        "rec:3",
+        "fav:0",
+        "fav:add:2",
+        "fav:del:1",
     ):
         parsed = parse_callback(data)
         assert parsed is not None
         assert encode_callback(*parsed) == data
+
+
+# ---------------------------------------------------------------------------
+# §4.7 델타3: 후속버튼(②)·매크로(③) 콜백 코덱(라우팅은 1b·1e — 여기선 코덱만)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_callback_rerun():
+    assert parse_callback("r:42") == ("r", "42")
+    assert parse_callback("r:42:go") == ("r", "42:go")
+
+
+def test_parse_callback_rerun_rejects_bad():
+    assert parse_callback("r:") is None
+    assert parse_callback("r:abc") is None
+    assert parse_callback("r:42:no") is None  # 접미는 정확히 'go' 만
+    assert parse_callback("r:42:go:x") is None
+    assert parse_callback("r:" + chr(0xFF14) + "2") is None  # 전각 숫자 U+FF14 차단(isascii)
+
+
+def test_parse_callback_fav():
+    assert parse_callback("fav:0") == ("fav", "0")
+    assert parse_callback("fav:add:2") == ("fav:add", "2")
+    assert parse_callback("fav:del:1") == ("fav:del", "1")
+
+
+def test_parse_callback_fav_rejects_bad():
+    assert parse_callback("fav:") is None
+    assert parse_callback("fav:x") is None
+    assert parse_callback("fav:add:") is None
+    assert parse_callback("fav:bad:1") is None  # add|del 만
+    assert parse_callback("fav:add:x") is None
+    assert parse_callback("fav:add:2:3") is None
+
+
+def test_parse_callback_recent():
+    assert parse_callback("rec:3") == ("rec", "3")
+
+
+def test_parse_callback_recent_rejects_bad():
+    assert parse_callback("rec:") is None
+    assert parse_callback("rec:x") is None
+    assert parse_callback("rec:²") is None  # 위첨자 숫자 차단(isascii)
+
+
+def test_new_callbacks_not_routed_in_handle_button_ack_only():
+    # 1a: r/fav/rec 는 코덱만 — _handle_button 미분기라 ack 후 무시(안전). 방출도 아직 없음.
+    a = FakeAdapter()
+    _fire(a, _btn(777, "r", "42"), target_root="root")
+    _fire(a, _btn(777, "fav:add", "2"), target_root="root")
+    _fire(a, _btn(777, "rec", "3"), target_root="root")
+    assert [c for c, _n in a.acked] == ["cq1", "cq1", "cq1"]  # ack 만
+    assert a.sent == [] and a.edited == []  # 무시(부작용 없음)
+
+
+# ---------------------------------------------------------------------------
+# §4.8 한글 명령 별칭(/프로젝트·/취소·/도움말) — 영어 정규로 접힘 / §4.3 /projects 버튼 목록
+# ---------------------------------------------------------------------------
+
+
+def test_korean_help_alias_routes_to_help():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/도움말"), target_root="root")
+    assert a.sent and a.sent[0][1] == bridge.HELP_TEXT
+
+
+def test_korean_projects_alias_lists_buttons(tmp_path):
+    (tmp_path / "etf_info").mkdir()
+    (tmp_path / "trading_info").mkdir()
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/프로젝트"), target_root=str(tmp_path))
+    _cid, body, buttons = a.sent[0]
+    assert body == ""  # 헤더 텍스트 제거 — 버튼만(버튼이 곧 목록)
+    assert {b.action for b in buttons} == {"p"}
+    assert {b.arg for b in buttons} == {"etf_info", "trading_info"}
+
+
+def test_korean_cancel_alias_clears_await(choice_env):
+    bridge.pending[50] = _pending_entry(await_reply=True)
+    _fire(choice_env, _txt(777, "/취소"), target_root="root")
+    assert 50 not in bridge.pending
+    assert any("취소" in t for _c, t, _b in choice_env.sent)
+
+
+def test_korean_aliases_are_commands_not_projects():
+    # parse_message 가 별칭을 프로젝트명으로 오해하지 않음(COMMANDS 소속·슬래시 접두).
+    for alias in ("/프로젝트", "/취소", "/도움말"):
+        assert parse_message(alias) is None
+        assert alias in bridge.COMMANDS
+
+
+def test_projects_header_empty_buttons_only(tmp_path):
+    # §4.3: 헤더 텍스트 없이 버튼만(빈 body) — 이전 "대상 프로젝트 N"·"• 라벨" 텍스트 회귀 잠금.
+    (tmp_path / "etf_info").mkdir()
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/projects"), target_root=str(tmp_path))
+    body, buttons = a.sent[0][1], a.sent[0][2]
+    assert body == ""
+    assert [b.action for b in buttons] == ["p"]
+
+
+# ---------------------------------------------------------------------------
+# 평문 별칭(슬래시 없이) — PUSH_WORDS 패턴. 단독 정확매칭만, 문장 속 단어는 미발동
+# ---------------------------------------------------------------------------
+
+
+def test_plain_projects_alias_lists_buttons(tmp_path):
+    (tmp_path / "etf_info").mkdir()
+    a = FakeAdapter()
+    _fire(a, _txt(777, "프로젝트"), target_root=str(tmp_path))
+    body, buttons = a.sent[0][1], a.sent[0][2]
+    assert body == ""  # 헤더 텍스트 제거 — 버튼만
+    assert [b.action for b in buttons] == ["p"]
+
+
+def test_plain_help_aliases_route_to_help():
+    for word in ("도움말", "사용법"):
+        a = FakeAdapter()
+        _fire(a, _txt(777, word), target_root="root")
+        assert a.sent[0][1] == bridge.HELP_TEXT
+
+
+def test_plain_cancel_alias_routes_to_cancel_command(choice_env):
+    # await 없을 때 평문 '취소' → /cancel 커맨드 경로(취소 안내).
+    bridge.pending.clear()
+    _fire(choice_env, _txt(777, "취소"), target_root="root")
+    assert any("취소할 작업이 없습니다." in t for _c, t, _b in choice_env.sent)
+
+
+def test_plain_cancel_during_await_routes_as_answer(choice_env):
+    # push 별칭과 동일: await 중 비-슬래시 '취소'는 답으로 라우팅(취소는 /취소·/cancel).
+    bridge.pending[50] = _pending_entry(await_reply=True)
+    _fire(choice_env, _txt(777, "취소"), target_root="root")
+    assert len(choice_env.resumes) == 1
+    assert choice_env.resumes[0]["answer"] == "취소"
+    assert 50 not in bridge.pending
+
+
+def test_plain_alias_sentence_not_command(tmp_path):
+    # 오탐 가드: 문장에 포함된 단어는 명령 아님("프로젝트 알려줘" → 프로젝트 해석 시도, 명령 아님).
+    bridge.chat_selection.clear()  # 선택 고정 누수 차단(실 run 방지)
+    (tmp_path / "etf_info").mkdir()
+    a = FakeAdapter()
+    _fire(a, _txt(777, "프로젝트 알려줘"), target_root=str(tmp_path))
+    # 명령이면 /projects(빈 body) 로 빠졌을 것 — 대신 못 찾음 안내(비어있지 않음).
+    assert not any(t == "" for _c, t, _b in a.sent)
+    assert any("찾지 못" in t for _c, t, _b in a.sent)
+
+
+def test_plain_cancel_in_sentence_not_command(tmp_path):
+    # "취소 좀 해줘" 는 취소 명령 아님(단독 '취소'만) — 프로젝트 해석 경로로(못 찾음 안내).
+    bridge.pending.clear()
+    bridge.chat_selection.clear()
+    (tmp_path / "etf_info").mkdir()
+    a = FakeAdapter()
+    _fire(a, _txt(777, "취소 좀 해줘"), target_root=str(tmp_path))
+    assert not any("취소했습니다" in t for _c, t, _b in a.sent)
+    assert any("찾지 못" in t for _c, t, _b in a.sent)
+
+
+# ---------------------------------------------------------------------------
+# 재시작 명령(평문·슬래시·영어) — 회신 먼저 → _restart(exit). 인가 필수·문장 오탐 가드
+# ---------------------------------------------------------------------------
+
+
+def test_restart_aliases_registered():
+    assert "/restart" in bridge.COMMANDS
+    assert {"재시작", "/재시작"} <= bridge.COMMANDS
+    assert bridge.PLAIN_ALIASES["재시작"] == "/restart"
+    assert bridge.COMMAND_ALIASES["/재시작"] == "/restart"
+
+
+def test_restart_sends_notice_then_calls_restart(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "_restart", lambda a, c, u: calls.append((a, c, u)))
+    for word in ("재시작", "/재시작", "/restart"):
+        a = FakeAdapter()
+        calls.clear()
+        _fire(a, _txt(777, word), target_root="root")
+        assert any("재시작" in t for _c, t, _b in a.sent)  # 회신 먼저(사용자 인지)
+        assert calls == [(a, 777, 777)]  # 그 뒤 _restart(어댑터·chat·user 전달)
+
+
+def test_restart_disallowed_user_blocked(monkeypatch):
+    # 인가 게이트: 비허용 user 는 재시작 불가(서비스 중단이라 절대 차단) — 무회신.
+    calls = []
+    monkeypatch.setattr(bridge, "_restart", lambda a, *_: calls.append(a))
+    a = FakeAdapter()
+    _fire(a, _txt(999, "재시작"), allowed=_ALLOWED, target_root="root")
+    assert calls == [] and a.sent == []
+
+
+def test_restart_in_sentence_not_command(monkeypatch, tmp_path):
+    # 문장 속 "재시작"은 미발동(단독 정확매칭만) — 프로젝트 해석 경로로.
+    calls = []
+    monkeypatch.setattr(bridge, "_restart", lambda a, *_: calls.append(a))
+    bridge.chat_selection.clear()
+    (tmp_path / "etf_info").mkdir()
+    a = FakeAdapter()
+    _fire(a, _txt(777, "재시작 좀 해줘"), target_root=str(tmp_path))
+    assert calls == []
+    assert any("찾지 못" in t for _c, t, _b in a.sent)
+
+
+def test_restart_helper_writes_marker_closes_exits(monkeypatch, tmp_path):
+    p = tmp_path / "restart_notice.json"
+    monkeypatch.setattr(bridge, "RESTART_NOTICE_FILE", p)
+    a = FakeAdapter()
+    closed = []
+    a.close = lambda: closed.append(True)  # type: ignore[method-assign]
+    with pytest.raises(SystemExit) as ei:
+        bridge._restart(a, 555, 777)
+    assert ei.value.code == 0
+    assert closed == [True]  # close 로 상태 flush(TG offset 등) 후 종료
+    assert bridge.pop_restart_notice(p) == 555  # 마커 기록됨(재기동 후 통지용)
+
+
+# --- 재시작 복귀 통지(마커 파일) ---
+
+
+def test_save_and_pop_restart_notice_roundtrip(tmp_path):
+    p = tmp_path / "restart_notice.json"
+    bridge.save_restart_notice(p, 777, 888)
+    assert p.exists()
+    assert bridge.pop_restart_notice(p) == 777
+    assert not p.exists()  # 1회성 — 읽으면 삭제(무한 알림 루프 방지)
+
+
+def test_pop_restart_notice_missing_is_none(tmp_path):
+    assert bridge.pop_restart_notice(tmp_path / "nope.json") is None
+
+
+def test_pop_restart_notice_corrupt_none_and_deleted(tmp_path):
+    p = tmp_path / "restart_notice.json"
+    p.write_text("{bad json", encoding="utf-8")
+    assert bridge.pop_restart_notice(p) is None
+    assert not p.exists()  # 손상도 삭제(재시도 루프 방지)
+
+
+def test_pop_restart_notice_non_int_channel_none(tmp_path):
+    p = tmp_path / "restart_notice.json"
+    p.write_text(json.dumps({"channel_id": "x"}), encoding="utf-8")
+    assert bridge.pop_restart_notice(p) is None  # 값 검증(정수만)
+
+
+def test_notify_restart_done_sends_completion():
+    a = FakeAdapter()
+    bridge._notify_restart_done(a, 555)
+    assert a.sent and a.sent[0][0] == 555 and "재시작 완료" in a.sent[0][1]
+
+
+def test_notify_restart_done_waits_ready_when_hook_present():
+    # DC 는 wait_ready(on_ready 대기) 훅이 있으면 그 뒤 send. TG(FakeAdapter)는 훅 없어 즉시.
+    a = FakeAdapter()
+    waited = []
+    a.wait_ready = lambda t=30: (waited.append(t), True)[1]  # type: ignore[attr-defined]
+    bridge._notify_restart_done(a, 555)
+    assert waited == [30]
+    assert a.sent[0][0] == 555
+
+
+def test_boot_marker_present_notifies_then_absent_no_notice(tmp_path):
+    # 기동 시(main 흐름): 마커 있으면 pop→통지, 없으면(크래시) 아무것도 안 함.
+    p = tmp_path / "restart_notice.json"
+    bridge.save_restart_notice(p, 555, 777)
+    assert bridge.pop_restart_notice(p) == 555  # 있음 → 통지 대상
+    a = FakeAdapter()
+    bridge._notify_restart_done(a, 555)
+    assert any("재시작 완료" in t for _c, t, _b in a.sent)
+    assert bridge.pop_restart_notice(p) is None  # 크래시 재기동 = 마커 없음 → 무동작
 
 
 def test_render_buttons_callback_within_tg_limit():
@@ -1141,7 +1432,7 @@ def test_button_valid_project_sends_guide(cb_env, tmp_path):
     assert len(cb_env.sent) == 1
     chat_id, text, _b = cb_env.sent[0]
     assert chat_id == 777
-    assert "etf_info" in text
+    assert text.startswith(f"[{project_label('etf_info')}]")  # 축약: 라벨 한 줄
 
 
 def test_button_invalid_project_no_send(cb_env, tmp_path):
@@ -1385,6 +1676,77 @@ def test_dispatch_no_targets_no_send(notify_env, monkeypatch):
     assert notify_env.saves == []
 
 
+def test_dispatch_to_alert_channel_when_mapped(notify_env, monkeypatch):
+    # DM 폐기(§4.4): #알림 채널이 매핑돼 있으면 그 채널로 send 1회(notify 아님).
+    _freeze_now(monkeypatch, _WED_0910)
+    notify_env._roles = {"알림": 999}
+    bridge.dispatch_notifications(notify_env, frozenset({111, 222}), [_item(id="a")])
+    assert [c for c, _t, _b in notify_env.sent] == [999]  # #알림 채널 1회(유저별 팬아웃 아님)
+    assert notify_env.notified == []  # DM(notify) 미사용
+    assert notify_env.sent[0][2][0] == Button("✅ 확인시작", "nb:ok", "a")
+
+
+# ---------------------------------------------------------------------------
+# ①(채널 자동생성) — 특수 채널 라우팅 + DM 폐기(재시작완료→#봇-상태)
+# ---------------------------------------------------------------------------
+
+
+def _spy_rcwp(monkeypatch):
+    # run_claude_with_progress(adapter, cid, header, exe, proj, task, timeout …) — proj=4·task=5.
+    runs = []
+    monkeypatch.setattr(
+        bridge,
+        "run_claude_with_progress",
+        lambda *args, **_kw: runs.append((args[4], args[5])),
+    )
+    return runs
+
+
+def test_general_channel_runs_project_less(monkeypatch, tmp_path):
+    # #간단처리(channel_role) → 프로젝트 무관 일반 실행: cwd=target_root, task=메시지 전체.
+    runs = _spy_rcwp(monkeypatch)
+    a = FakeAdapter()
+    ev = Event(kind="text", channel_id=100, user_id=777, text="2+2 뭐야", channel_role="간단처리")
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == [(str(tmp_path), "2+2 뭐야")]
+
+
+def test_data_analysis_channel_runs_general(monkeypatch, tmp_path):
+    # #데이터-분석도 일반 실행(한계 안내는 채널 토픽 1회 — 매 메시지 반복 없음).
+    runs = _spy_rcwp(monkeypatch)
+    a = FakeAdapter()
+    ev = Event(
+        kind="text", channel_id=100, user_id=777, text="MU 조사해", channel_role="데이터분석"
+    )
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == [(str(tmp_path), "MU 조사해")]
+    assert not any("HTML" in t for _c, t, _b in a.sent)  # 매 메시지 안내 금지
+
+
+def test_general_channel_commands_still_work(monkeypatch, tmp_path):
+    # 특수 채널에서도 명령(/help)은 정상 — role 분기는 free-form 실행에만.
+    runs = _spy_rcwp(monkeypatch)
+    a = FakeAdapter()
+    ev = Event(kind="text", channel_id=100, user_id=777, text="/help", channel_role="간단처리")
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == []  # 실행 아님
+    assert a.sent[0][1] == bridge.HELP_TEXT
+
+
+def test_restart_done_to_status_channel():
+    # 재시작 완료 → #봇-상태 채널 고정(DM/원채널 아님).
+    a = FakeAdapter(roles={"봇상태": 888})
+    bridge._notify_restart_done(a, 555)  # 555 = 마커의 요청 chat
+    assert a.sent[0][0] == 888 and "재시작 완료" in a.sent[0][1]
+
+
+def test_restart_done_fallback_to_marker_chat_without_channel():
+    # TG(채널 없음): #봇-상태 미매핑 → 요청 chat(마커 channel_id)으로 폴백.
+    a = FakeAdapter()  # roles 비어있음
+    bridge._notify_restart_done(a, 555)
+    assert a.sent[0][0] == 555 and "재시작 완료" in a.sent[0][1]
+
+
 def _write_schedules(monkeypatch, tmp_path, items):
     p = tmp_path / "notify.json"
     p.write_text(json.dumps({"items": items}, ensure_ascii=False), encoding="utf-8")
@@ -1462,7 +1824,7 @@ def test_button_nb_ok_project_unresolved_errors(notify_env, monkeypatch, tmp_pat
     monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: runs.append(1))
     _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
     assert runs == []
-    assert any("찾지 못해" in t for _c, _m, t, _b in notify_env.edited)
+    assert any("찾지 못" in t for _c, _m, t, _b in notify_env.edited)
 
 
 def test_button_nb_ok_no_item_falls_back(notify_env, monkeypatch, tmp_path):
@@ -1940,7 +2302,8 @@ def test_await_reply_slash_command_falls_through(choice_env, tmp_path):
     bridge.pending[50] = _pending_entry(await_reply=True)
     _fire(choice_env, _txt(777, "/projects"), target_root=str(tmp_path))
     assert choice_env.resumes == []
-    assert any("대상 프로젝트" in t for _c, t, _b in choice_env.sent)
+    # /projects 는 헤더 텍스트 없이 버튼만(§4.3 — 버튼이 곧 목록).
+    assert any(b and all(x.action == "p" for x in b) for _c, _t, b in choice_env.sent)
     assert 50 in bridge.pending
 
 
@@ -2327,9 +2690,8 @@ def test_bare_project_name_pins_selection_without_running(sel_env, monkeypatch, 
     _fire(sel_env, _txt(777, "trading_info"), repo_root=tmp_path, target_root=root)
     assert bridge.chat_selection[777] == "trading_info"
     assert sel_env.runs == []
-    assert any(
-        "데모 라벨" in t and "trading_info" in t and "선택" in t for _c, t, _b in sel_env.sent
-    )
+    # 축약 확인 문구: "[데모 라벨]" 한 줄(폴더명·긴 힌트 반복 제거).
+    assert any("[데모 라벨]" in t for _c, t, _b in sel_env.sent)
 
 
 # ===========================================================================
@@ -2371,6 +2733,27 @@ def test_adapter_normalizes_photo_update(tmp_path):
     assert ev.kind == "photo" and ev.text == "MU" and ev.photo_ref == "big"
 
 
+def test_adapter_fills_reply_to_when_present(tmp_path):
+    # §4.7 델타2: reply_to_message.message_id → Event.reply_to(채우기만, 소비는 1c).
+    upd = {
+        "message": {
+            "chat": {"id": 777},
+            "from": {"id": 777},
+            "message_id": 5,
+            "text": "이어서 해줘",
+            "reply_to_message": {"message_id": 42},
+        }
+    }
+    ev = next(iter(_ta(tmp_path)._to_events(upd)))
+    assert ev.reply_to == 42
+
+
+def test_adapter_reply_to_none_when_absent(tmp_path):
+    upd = {"message": {"chat": {"id": 777}, "from": {"id": 777}, "message_id": 5, "text": "hi"}}
+    ev = next(iter(_ta(tmp_path)._to_events(upd)))
+    assert ev.reply_to is None
+
+
 def test_adapter_normalizes_callback_update(tmp_path):
     cq = {
         "id": "cq9",
@@ -2394,6 +2777,22 @@ def test_adapter_ignores_edited_message(tmp_path):
     # D6: edited_message 는 무시(신규 message 만 트리거).
     upd = {"edited_message": {"chat": {"id": 777}, "text": "x"}}
     assert list(_ta(tmp_path)._to_events(upd)) == []
+
+
+def test_adapter_close_flushes_offset(tmp_path):
+    # 재시작(exit)으로 poll 의 yield-후 save 를 못 밟아도 close 가 커서를 flush(재수신 루프 차단).
+    off = tmp_path / "offset"
+    ta = TelegramAdapter("T", [], off)
+    ta._offset = 500  # poll 진행분 모사
+    ta.close()
+    assert load_offset(off) == 500
+
+
+def test_adapter_close_skips_flush_when_unpolled(tmp_path):
+    # _offset==0(미폴링)이면 저장 안 함 — 스테일 0 으로 기존 offset 을 덮지 않게.
+    off = tmp_path / "offset"
+    TelegramAdapter("T", [], off).close()
+    assert not off.exists()
 
 
 # ===========================================================================
@@ -2429,6 +2828,22 @@ def test_adapter_send_masks_secrets(monkeypatch, tmp_path):
     ta = TelegramAdapter("T", ["SECRET"], tmp_path / "offset")
     ta.send(777, "tok=SECRET")
     assert calls[0][1]["text"] == "tok=***"
+
+
+def test_adapter_send_empty_body_with_buttons_neutral_label(monkeypatch, tmp_path):
+    # 🟡2 회귀: 빈 본문 + 버튼(/projects) → "(빈 응답)" 대신 중립 라벨.
+    calls = _spy_tg(monkeypatch)
+    ta = TelegramAdapter("T", [], tmp_path / "offset")
+    ta.send(777, "", [Button("데모", "p", "etf_info")])
+    assert calls[0][1]["text"] == "대상 프로젝트"
+    assert "reply_markup" in calls[0][1]  # 버튼 함께
+
+
+def test_adapter_send_empty_body_no_buttons_keeps_placeholder(monkeypatch, tmp_path):
+    calls = _spy_tg(monkeypatch)
+    ta = TelegramAdapter("T", [], tmp_path / "offset")
+    ta.send(777, "")
+    assert calls[0][1]["text"] == "(빈 응답)"  # 버튼 없으면 기존 유지
 
 
 def test_adapter_edit_overflow_edits_then_sends(monkeypatch, tmp_path):

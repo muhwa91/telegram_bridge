@@ -45,6 +45,8 @@ OFFSET_FILE = LOG_DIR / "offset"
 PID_FILE = LOG_DIR / "bridge.pid"
 SCHEDULES_FILE = PROJECT_DIR / "schedules" / "notify.json"
 NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
+RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
+CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # DC channelID→(kind,tag) 매핑(자동생성 §4.4)
 PHOTO_DIR = LOG_DIR / "photos"
 
 # ① 시각 알림용 상수. now·요일 판정은 항상 KST 기준(스케줄 at 은 KST HH:MM).
@@ -63,10 +65,41 @@ _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 PROGRESS_THROTTLE_SEC = 2.5  # 진행 편집 최소 간격(rate-limit 보호) — 카데언스는 코어 소유(§2.2)
 PROGRESS_TAIL_LINES = 12  # 진행 메시지에 표시할 최근 이벤트 줄 수(도배 방지)
 NOTIFY_TICK_SEC = 25  # 알림 스케줄 주기 틱(§3.3 — poll 과 독립된 타이머 스레드)
+# 진행/알림 헤더 선두 이모지(§4.1). 코어가 헤더에 쓰고 DC 어댑터가 STATUS_LEADERS 를 import 해
+# 상태색(노랑)을 판정한다 — HEADER_* 와 동형 단일 소스(색 조용히 어긋남 방지). 여기서 바꾸면 끝.
+LEAD_RUN = "🔄"  # 진행(작업 중·이어서)
+LEAD_PHOTO = "🔍"  # 사진 대조
+LEAD_CHECK = "🔎"  # 예약 점검
+LEAD_NOTIFY = "⏰"  # 예약 알림/스누즈
+STATUS_LEADERS = (LEAD_RUN, LEAD_PHOTO, LEAD_CHECK, LEAD_NOTIFY)
 # push 별칭(정확 일치만 push 로 취급 — 부분매칭 금지). 영어/한글 변형을 한 집합으로.
 # COMMANDS 에 포함시켜 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
 PUSH_WORDS = frozenset({"push", "푸시", "푸시해", "푸시해줘", "푸쉬", "푸쉬해", "푸쉬해줘"})
-COMMANDS = frozenset({"/help", "/start", "/projects", "/cancel"}) | PUSH_WORDS
+# 한글 명령 별칭(§4.8 모바일 우선) → 영어 정규. /즐겨찾기·/최근 은 1e(죽은 명령 금지 — 미추가).
+COMMAND_ALIASES = {
+    "/도움말": "/help",
+    "/프로젝트": "/projects",
+    "/취소": "/cancel",
+    "/재시작": "/restart",
+}
+# 평문 별칭(슬래시 없이) — PUSH_WORDS 처럼 strip+casefold 단독 정확매칭. 문장 속 단어는 미발동
+# (routing 이 stripped 전체를 대조하므로 "취소 좀 해줘"·"프로젝트 알려줘"는 명령 아님).
+PLAIN_ALIASES = {
+    "프로젝트": "/projects",
+    "도움말": "/help",
+    "사용법": "/help",
+    "취소": "/cancel",
+    "재시작": "/restart",
+}
+# 별칭(슬래시·평문)도 COMMANDS 에 넣어 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
+COMMANDS = (
+    frozenset({"/help", "/start", "/projects", "/cancel", "/restart"})
+    | frozenset(COMMAND_ALIASES)
+    | frozenset(PLAIN_ALIASES)
+    | PUSH_WORDS
+)
+# 특수 채널 역할 중 "프로젝트 무관 일반 실행" 대상(§4.4). 데이터분석 한계 안내는 채널 토픽에 1회.
+_GENERAL_ROLES = frozenset({"간단처리", "데이터분석"})
 
 # 방/프로젝트 한글 표시명은 repo 루트 _Core/project_labels.json(단일 소스)에서 로드한다.
 # 정의는 find_repo_root 뒤(load_project_labels)로 배치 — PROJECT_LABELS 는 아래에서 대입된다.
@@ -266,22 +299,20 @@ def project_label(name: str) -> str:
 
 
 def project_guide(name: str) -> str:
-    """프로젝트 버튼 탭 시 안내 문구(선택 고정 — 이후 프로젝트명 없이 작업만 보내면 됨)."""
-    return (
-        f"{project_label(name)}({name}) 선택 — 이제 프로젝트명 없이 작업만 보내도 "
-        f"이 프로젝트에서 실행됩니다. 예) README 고쳐줘"
-    )
+    """프로젝트 선택 고정 확인(축약). 사용법 힌트는 HELP 에 있어 반복 제거 — 라벨 + 서브텍스트."""
+    return f"[{project_label(name)}]\n-# 지시만 보내면 이 프로젝트에서 실행"
 
 
 # ── Button 빌더(플랫폼 무관, 코어 잔류) — 어댑터가 render_buttons 로 플랫폼 UI 렌더 ──
 def push_buttons() -> list[Button]:
-    """[✅ Push][❌ 취소] — push 승인/취소."""
-    return [Button("✅ Push", "push", style="primary"), Button("❌ 취소", "x", style="danger")]
+    """[✅ Push][취소] — Push=success(초록 승인), 취소=secondary(danger 는 파괴 전용, §4.7)."""
+    return [Button("✅ Push", "push", style="success"), Button("취소", "x", style="secondary")]
 
 
 def project_buttons(names: list[str]) -> list[Button]:
-    """프로젝트명 리스트 → 선택 버튼(라벨=한글 표시명, action="p", arg=폴더명)."""
-    return [Button(project_label(n), "p", n) for n in names]
+    """프로젝트명 리스트 → 선택 버튼. 라벨=📁+한글 표시명(시각 앵커), style=primary(다크 배경 대비
+    — default→secondary 는 묻힘). primary 는 프로젝트 목록 전용 — push/choice/notify 매핑 무변경."""
+    return [Button(f"📁 {project_label(n)}", "p", n, style="primary") for n in names]
 
 
 def notify_buttons(item_id: str) -> list[Button]:
@@ -574,9 +605,8 @@ def dispatch_notifications(
     스누즈는 1회 발송 후 해제한다. 날짜가 바뀌면 지난 fired 를 정리한다. 상태 조회·변이는
     _notify_lock 아래에서 원자적으로(타이머 스레드↔워커 경합 방지), 실제 전송은 락 밖에서 한다.
 
-    H-1: 발송 타겟은 `adapter.notify(user_id, ...)` — 인가목록(allowed)은 user_id 이지 채널이 아님.
-    디스코드에서 send(user_id) 는 get_channel(user_id) 실패로 알림을 조용히 유실시킨다. notify 가
-    user_id → DM(디스코드)/1:1 chat(텔레그램)으로 해석해 발송한다(인가 키와 채널 타겟의 분리).
+    DM 폐기(§4.4): DC 는 #알림 채널(role_channel("알림"))로 send — 채널 1곳에 1회. 채널 매핑이
+    없으면(TG·자동생성 실패) `adapter.notify(user_id, ...)` 로 폴백해 허용 user 1:1 에 발송한다.
     """
     now = datetime.now(_KST)
     today = now.date().isoformat()
@@ -595,14 +625,18 @@ def dispatch_notifications(
             item_id = it.get("id")
             if not isinstance(item_id, str) or not item_id:
                 continue
-            text = f"⏰ {it.get('label', '')}\n{it.get('note', '')}".strip()
+            text = f"{LEAD_NOTIFY} {it.get('label', '')}\n{it.get('note', '')}".strip()
             outgoing.append((item_id, text))
             notify_fired.add((item_id, today))
             notify_snooze.pop(item_id, None)
         save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
+    alert_ch = adapter.role_channel("알림")  # DC #알림 채널ID(없으면 None → TG notify 폴백)
     for item_id, text in outgoing:
-        for user_id in allowed:  # allowed = 인가 user_id — notify 가 DM/1:1 chat 으로 해석(H-1)
-            adapter.notify(user_id, text, notify_buttons(item_id))
+        if alert_ch is not None:
+            adapter.send(alert_ch, text, notify_buttons(item_id))  # DC: #알림 채널 1회
+        else:
+            for user_id in allowed:  # TG 폴백: 허용 user 1:1(notify=send(chat))
+                adapter.notify(user_id, text, notify_buttons(item_id))
 
 
 def list_projects(target_root: str) -> list[str]:
@@ -904,23 +938,78 @@ def do_push(root: Path) -> str:
     return f"{HEADER_DONE}\n\npull --rebase 후 push 성공 — 원격 main 에 반영됐습니다.{stash_warn}"
 
 
+def save_restart_notice(path: Path, channel_id: int, user_id: int) -> None:
+    """재시작 마커 기록(원자적) — 재기동한 프로세스가 이 chat 에 '완료'를 통지한다.
+
+    명시 `재시작` 요청만 기록한다(크래시 재기동은 마커 없음 → 조용히 복구, 스팸 방지).
+    """
+    payload = {"channel_id": channel_id, "user_id": user_id, "ts": time.time()}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(path)
+
+
+def pop_restart_notice(path: Path) -> int | None:
+    """재시작 마커를 읽고 **삭제**(1회성 — 무한 알림 루프 방지). channel_id(정수) 반환.
+
+    파일 없음·파싱 실패·비정수 channel_id 는 조용히 None. 읽기 시도 후엔(손상 포함) 삭제한다.
+    """
+    if not path.exists():
+        return None
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    path.unlink(missing_ok=True)  # 1회성: 읽었으면(손상이어도) 지운다
+    cid = raw.get("channel_id") if isinstance(raw, dict) else None
+    return cid if isinstance(cid, int) else None  # 값 검증(정수만)
+
+
+def _restart(adapter: Adapter, channel_id: int, user_id: int) -> None:
+    """재시작 명령: 마커 기록 → 어댑터 정리(close) → 프로세스 종료(exit 0). 런처/systemd 재기동.
+
+    마커(save_restart_notice)는 재기동 후 이 chat 에 '✅ 재시작 완료'를 통지하려고 남긴다. close()
+    는 TG offset 커서를 flush 해 재시작 메시지 재수신(무한 재시작 루프)을 막고, DC 는 Gateway/루프를
+    정리한다. 진행 중 claude 실행이 있어도 강제 종료 수용(개인용 자기수정 루프 — 드레이닝 과설계
+    금지). 회신은 호출측이 exit 전에 이미 보냈다(멱등 close 라 main finally 와 이중 안전).
+    """
+    save_restart_notice(RESTART_NOTICE_FILE, channel_id, user_id)
+    log.info("재시작 요청 — 마커 기록·어댑터 정리 후 종료(exit 0)")
+    adapter.close()
+    sys.exit(0)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 이벤트 처리 (통합 디스패처 handle_event + kind 별 헬퍼)
 # ══════════════════════════════════════════════════════════════════════════
+# §4.8 목업 CASE6(폰 실측 반영): 섹션 제목 `## `(디스코드 큰 헤더), 명령어는 제목 다음 줄
+# `명령어 - …`, 부가 힌트는 `-# ` 서브텍스트(작은 회색)로 위계 분리. 한글 명령 주력·영어 별칭 병기.
+# TG 는 plain 이라 `##`·`-#` 기호가 그대로 노출되지만 곧 제거될 플랫폼이라 디스코드 가독성 우선
+# (어댑터별 후처리 분기 없이 단일 문자열 — 최소 복잡도).
 HELP_TEXT = (
-    "브리지 사용법\n"
+    "## 작업 실행\n"
+    "프로젝트를 고르고 자유롭게 지시하세요.\n"
+    "`etf_info 오늘 데이터 정확도 로그 확인해줘`\n"
+    "-# 한 번 고르면 이후엔 지시만 보내도 그 프로젝트에서 실행됩니다.\n"
     "\n"
-    "• <프로젝트명> <작업지시> — 해당 프로젝트에서 Claude 작업 실행\n"
-    "  예) etf_info 오늘 데이터 정확도 로그 확인해줘\n"
-    "• 프로젝트 선택 — /projects 목록의 버튼을 탭하거나 프로젝트명만 전송.\n"
-    "  한 번 고르면 이후엔 이름 없이 작업 내용만 보내도 그 프로젝트로 실행됩니다.\n"
-    "• push — 로컬 커밋을 원격에 반영(pull --rebase 후 push).\n"
-    "  push / 푸시 / 푸시해 / 푸시 해줘 등 다 됩니다(대소문자·띄어쓰기 무관).\n"
-    "• 사진 대조 — 토스 캡처 사진을 캡션에 종목을 적어 보내면 우리 값과 대조.\n"
-    "  예) 사진 + 캡션 MU\n"
-    "• /cancel — 대기 중인 선택 입력 취소\n"
-    "• /projects — 대상 프로젝트 목록\n"
-    "• /help — 이 도움말"
+    "## 프로젝트 선택\n"
+    "명령어 - 프로젝트 · /프로젝트 · /projects\n"
+    "목록 버튼을 탭해 대상 프로젝트를 고정합니다.\n"
+    "\n"
+    "## 커밋 반영\n"
+    "명령어 - push · 푸시 · 푸시해줘 (대소문자·띄어쓰기 무관)\n"
+    "로컬 커밋을 원격 main 에 push 합니다(pull --rebase 후).\n"
+    "\n"
+    "## 사진 대조\n"
+    "토스 캡처를 캡션에 종목을 적어 보내면 우리 값과 대조합니다.\n"
+    "`사진 + 캡션: MU`\n"
+    "\n"
+    "## 선택 취소\n"
+    "명령어 - 취소 · /취소 · /cancel\n"
+    "대기 중인 선택 입력을 취소합니다.\n"
+    "\n"
+    "## 도움말\n"
+    "명령어 - 도움말 · 사용법 · /도움말 · /help"
 )
 
 
@@ -1046,7 +1135,7 @@ def resume_run(
     data = run_claude_with_progress(
         adapter,
         channel_id,
-        "🔄 이어서 작업 중…",
+        f"{LEAD_RUN} 이어서 작업 중…",
         claude_exe,
         proj_path,
         answer,
@@ -1059,7 +1148,7 @@ def resume_run(
         run_claude_with_progress(
             adapter,
             channel_id,
-            "🔄 (재시도) 이어서…",
+            f"{LEAD_RUN} (재시도) 이어서…",
             claude_exe,
             proj_path,
             fallback,
@@ -1132,7 +1221,7 @@ def _handle_photo(
     #    대조 후 다운로드 파일은 성공·실패 무관 삭제(L-1: 무한 누증 방지).
     log.info("chat=%s 사진 대조 ticker=%s", channel_id, ticker)
     prompt = build_compare_prompt(image, ticker, ours)
-    header = f"🔍 [{ticker}] 캡처 대조 중…"
+    header = f"{LEAD_PHOTO} [{ticker}] 캡처 대조 중…"
     try:
         run_claude_with_progress(
             adapter, channel_id, header, claude_exe, proj_path, prompt, timeout, ["Read"]
@@ -1204,7 +1293,7 @@ def _handle_button(
             run_claude_with_progress(
                 adapter,
                 channel_id,
-                f"🔎 {label} 확인 중…",
+                f"{LEAD_CHECK} {label} 확인 중…",
                 claude_exe,
                 proj_path,
                 build_notify_check_prompt(label, note),
@@ -1213,7 +1302,7 @@ def _handle_button(
             )
         elif item is not None and note and proj_path is None:
             # 프로젝트 폴더 미해석(삭제·오타) — 실행 불가 안내.
-            msg = "프로젝트를 찾지 못해 확인을 실행하지 못했습니다."
+            msg = "프로젝트를 찾지 못했습니다."
             if isinstance(message_id, int):
                 adapter.edit(channel_id, message_id, msg)
             else:
@@ -1231,7 +1320,7 @@ def _handle_button(
         with _notify_lock:
             notify_snooze[arg] = (datetime.now(_KST) + timedelta(minutes=30)).isoformat()
             save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
-        later = "⏰ 30분 뒤 다시 알립니다."
+        later = f"{LEAD_NOTIFY} 30분 뒤 다시 알립니다."
         if isinstance(message_id, int):
             adapter.edit(channel_id, message_id, later)
         else:
@@ -1250,7 +1339,7 @@ def _handle_button(
         ):
             log.info("chat=%s callback c 만료 mid=%s", channel_id, mid_s)
             if isinstance(message_id, int):
-                adapter.edit(channel_id, message_id, "선택이 만료됐습니다. 다시 요청해주세요.")
+                adapter.edit(channel_id, message_id, "선택이 만료됐습니다.")
             return
         assert mid is not None  # 위 가드(entry dict)가 보장 — mypy 좁히기
         session_id, proj = entry.get("session_id"), entry.get("project_path")
@@ -1343,18 +1432,20 @@ def _handle_text(
             )
         return
 
-    if stripped in ("/help", "/start") or (stripped.startswith("/") and stripped not in COMMANDS):
+    # 한글 명령 별칭(§4.8)을 영어 정규로 접어 아래 분기가 한 경로만 알게 한다(별칭도 COMMANDS 소속).
+    # 슬래시 별칭은 원문 정확매칭, 평문 별칭은 PUSH_WORDS 처럼 casefold 단독매칭(문장은 미발동).
+    cmd = COMMAND_ALIASES.get(stripped) or PLAIN_ALIASES.get(stripped.casefold()) or stripped
+    if cmd in ("/help", "/start") or (cmd.startswith("/") and cmd not in COMMANDS):
         log.info("chat=%s cmd=/help", channel_id)
         adapter.send(channel_id, HELP_TEXT)
         return
-    if stripped == "/projects":
+    if cmd == "/projects":
+        # §4.3: 버튼이 곧 목록 — 헤더 텍스트 없이 버튼만(DC V2 는 TextDisplay 생략, TG 는 최소).
         names = list_projects(target_root)
-        lines = "\n".join(f"• {project_label(n)} ({n})" for n in names) or "(없음)"
-        body = "대상 프로젝트\n" + lines
         log.info("chat=%s cmd=/projects count=%d", channel_id, len(names))
-        adapter.send(channel_id, body, project_buttons(names))
+        adapter.send(channel_id, "", project_buttons(names))
         return
-    if stripped == "/cancel":
+    if cmd == "/cancel":
         # ③ 이 chat + user 의 직접입력 대기만 해제(M-1: 같은 채널 남의 대기 안 건드림). 없으면 안내.
         cleared = [
             m
@@ -1366,9 +1457,15 @@ def _handle_text(
         ]
         for m in cleared:
             pending.pop(m, None)
-        note = "대기 중이던 선택 입력을 취소했습니다." if cleared else "취소할 작업이 없습니다."
+        note = "취소했습니다." if cleared else "취소할 작업이 없습니다."
         adapter.send(channel_id, note)
         return
+    if cmd == "/restart":
+        # 자기수정 루프 완결: 회신 먼저 보내 사용자에게 재시작을 알린 뒤 프로세스 종료(런처 재기동).
+        log.info("chat=%s cmd=restart", channel_id)
+        adapter.send(channel_id, "♻️ 재시작합니다…")
+        _restart(adapter, channel_id, event.user_id)
+        return  # 도달하지 않음(_restart 가 exit) — 방어적
     # casefold: 폰 자동 대문자화("Push")도 인식. 내부 공백 접기: "푸시 해줘"·"푸시 해"도 push 로
     # (PUSH_WORDS 는 붙여쓰기 유지). parse_message/COMMANDS 는 원문 기준이라 문장 오탐엔 무영향.
     if "".join(stripped.split()).casefold() in PUSH_WORDS:
@@ -1377,6 +1474,23 @@ def _handle_text(
         adapter.send(channel_id, result)
         outcome = "완료" if result.startswith(HEADER_DONE) else "실패"
         log.info("chat=%s push 결과=%s", channel_id, outcome)
+        return
+
+    # 특수 채널(#간단처리·#데이터-분석): 프로젝트 무관 일반 실행 — cwd=target_root·full tools(§4.4).
+    # 프로젝트 접두·선택 고정 없이 메시지 전체를 지시로 실행. 인가·stdin·화이트리스트 불변.
+    # 데이터분석 한계 안내는 채널 토픽에 1회(어댑터) — 매 메시지 반복 금지.
+    if event.channel_role in _GENERAL_ROLES:
+        log.info("chat=%s 일반 실행 role=%s", channel_id, event.channel_role)
+        run_claude_with_progress(
+            adapter,
+            channel_id,
+            f"{LEAD_RUN} 작업 중…",
+            claude_exe,
+            target_root,
+            text,
+            timeout,
+            user_id=event.user_id,
+        )
         return
 
     # ④ 선택 고정 해석: 첫 단어가 유효 프로젝트면 명시 우선, 아니면 채널 선택으로 실행.
@@ -1390,7 +1504,8 @@ def _handle_text(
     if target is None:
         names = list_projects(target_root)
         first = stripped.split(maxsplit=1)[0] if stripped else ""
-        body = f"'{first}' 프로젝트를 찾지 못했습니다.\n대상: " + (", ".join(names) or "(없음)")
+        # 대상 목록은 버튼이 곧 목록이라 인라인 나열 생략 — 원인 한 줄만.
+        body = f"'{first}' 프로젝트를 찾지 못했습니다."
         # 보안: 사용자 입력 first 를 %r 로 로깅해 개행 위조(로그 포깅)를 차단.
         log.warning("chat=%s 알수없는 프로젝트=%r", channel_id, first)
         adapter.send(channel_id, body, project_buttons(names))
@@ -1403,7 +1518,7 @@ def _handle_text(
         return
 
     log.info("chat=%s 실행 project=%s", channel_id, project)
-    header = f"🔄 [{project}] 작업 중…"
+    header = f"{LEAD_RUN} [{project}] 작업 중…"
     data = run_claude_with_progress(
         adapter, channel_id, header, claude_exe, proj_path, task, timeout, user_id=event.user_id
     )
@@ -1477,6 +1592,20 @@ def setup_logging() -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+
+def _notify_restart_done(adapter: Adapter, channel_id: int) -> None:
+    """재기동 후 '✅ 재시작 완료'를 1회 send. DC 는 on_ready 대기 후 #봇-상태 채널로(DM 폐기 §4.4).
+
+    타겟: DC = role_channel("봇상태") 고정 · TG(채널 없음) = 마커의 요청 chat(channel_id) 폴백.
+    wait_ready 는 DC 만의 얇은 훅(getattr 선택 호출 — TG 는 동기). send 실패해도 무해 — 마커는
+    이미 pop 에서 삭제됐다(1회성, 무한 알림 방지).
+    """
+    wait_ready = getattr(adapter, "wait_ready", None)
+    if callable(wait_ready):
+        wait_ready(30)  # DC: Gateway on_ready 까지(≤30s). 타임아웃이어도 시도는 한다.
+    status_ch = adapter.role_channel("봇상태")  # DC #봇-상태(없으면 요청 chat 폴백)
+    adapter.send(status_ch if status_ch is not None else channel_id, "✅ 재시작 완료")
 
 
 def _dispatch_loop(
@@ -1554,9 +1683,11 @@ def main() -> int:
         # discord.py 미설치 노트북에서도 죽지 않는다(본체 stdlib 전용 계약 유지).
         from discord_adapter import DiscordAdapter
 
-        adapter = DiscordAdapter(token, secrets, allowed)
+        adapter = DiscordAdapter(token, secrets, allowed, channel_map_file=CHANNEL_MAP_FILE)
     else:
         adapter = TelegramAdapter(token, secrets, OFFSET_FILE)
+    # ①(채널 자동생성 §4.4): 프로젝트 채널 목록 주입 — DC 는 on_ready 에서 생성, TG 는 no-op.
+    adapter.setup_channels(list_projects(target_root))
     log.info(
         "브리지 시작(%s). target_root=%s allowed=%d개 알림=%d건",
         "discord" if use_discord else "telegram",
@@ -1564,6 +1695,18 @@ def main() -> int:
         len(allowed),
         len(schedules),
     )
+
+    # 재시작 복귀 통지: '재시작' 마커가 있으면(명시 재시작만) 재기동 후 그 chat 에 1회 알린다.
+    # 별도 daemon 스레드 — 어댑터 준비(DC on_ready)를 기다렸다 send 1회. poll 시작 전 띄워도
+    # wait_ready 가 poll 이 봇 스레드를 기동할 때까지 블록한다(크래시 재기동은 마커 없음 → 무동작).
+    notice_cid = pop_restart_notice(RESTART_NOTICE_FILE)
+    if notice_cid is not None:
+        threading.Thread(
+            target=_notify_restart_done,
+            args=(adapter, notice_cid),
+            name="restart-notice",
+            daemon=True,
+        ).start()
 
     # ① 시각 알림: poll(롱폴링)이 블록하는 동안에도 발송되도록 독립 타이머 스레드로 구동(§3.3).
     stop = threading.Event()
@@ -1603,7 +1746,10 @@ def _selftest() -> None:
     assert parse_message("/help") is None
     assert parse_message("push") is None
     assert PUSH_WORDS <= COMMANDS  # 모든 별칭이 COMMANDS 에 포함
+    assert frozenset(PLAIN_ALIASES) <= COMMANDS  # 평문 별칭도 COMMANDS 소속(프로젝트 오인 방지)
+    assert "/restart" in COMMANDS and PLAIN_ALIASES["재시작"] == "/restart"  # 재시작 명령 등록
     assert all(parse_message(w) is None for w in PUSH_WORDS)  # bare 별칭은 push 커맨드
+    assert parse_message("프로젝트 알려줘") == ("프로젝트", "알려줘")  # 문장은 명령 아님(2단어)
     assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")  # 문장은 push 아님
     assert "Push".casefold() in PUSH_WORDS  # 폰 자동 대문자화도 push 로
     assert is_allowed(7, frozenset({7})) and not is_allowed(1, frozenset({7}))
@@ -1630,6 +1776,7 @@ def _selftest() -> None:
     assert [b.action for b in push_buttons()] == ["push", "x"]
     _pb = project_buttons(["a", "b"])
     assert _pb[0].action == "p" and _pb[0].arg == "a"
+    assert _pb[0].style == "primary" and _pb[0].label.startswith("📁")  # 다크 대비·시각 앵커
     assert notify_buttons("y")[0] == Button("✅ 확인시작", "nb:ok", "y")
     _cb = choice_buttons(55, [("유지", "keep")])
     assert _cb[0].action == "c" and _cb[0].arg == "55:0" and _cb[-1].arg == "55:other"
@@ -1642,6 +1789,9 @@ def _selftest() -> None:
     _np = build_notify_check_prompt("개장", "등락률 확인")
     assert "개장" in _np and "수정·커밋은 하지 마라" in _np
     assert "Read" in NOTIFY_CHECK_TOOLS and "Edit" not in NOTIFY_CHECK_TOOLS
+    # F2 단일 소스: 진행/알림 헤더 선두 이모지가 STATUS_LEADERS 와 일치(DC 색 판정과 어긋남 방지).
+    assert set(STATUS_LEADERS) == {LEAD_RUN, LEAD_PHOTO, LEAD_CHECK, LEAD_NOTIFY}
+    assert f"{LEAD_RUN} 작업 중…"[0] in STATUS_LEADERS
     # 선택지 파싱.
     assert parse_choice_prompt("옵션.\n❓선택: [유지|keep]|[교체|swap]") == (
         "옵션.",

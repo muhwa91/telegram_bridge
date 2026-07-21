@@ -55,7 +55,14 @@ from adapter import (
 # 코어 회신 헤더 상수(§4.1 색 판정 단일 소스) + 프로젝트 한글 라벨(채널명 표시용). 어댑터→코어
 # 방향 import 지만 discord.py 를 코어로 끌어들이지 않는다(bridge 는 stdlib 전용·discord_adapter 를
 # top-level import 안 함 — 순환 없음). PROJECT_LABELS 는 채널 표시명, channel_map 값은 폴더명 원문.
-from bridge import HEADER_DONE, HEADER_FAIL, HEADER_NOTE, PROJECT_LABELS, STATUS_LEADERS
+from bridge import (
+    HEADER_CHOICE,
+    HEADER_DONE,
+    HEADER_FAIL,
+    HEADER_NOTE,
+    PROJECT_LABELS,
+    STATUS_LEADERS,
+)
 
 log = logging.getLogger("bridge")
 
@@ -191,6 +198,7 @@ def _status_color(text: str) -> int | None:
         (HEADER_DONE, _COLOR_DONE),
         (HEADER_FAIL, _COLOR_FAIL),
         (HEADER_NOTE, _COLOR_INFO),
+        (HEADER_CHOICE, _COLOR_INFO),  # 선택 질문 = '입력 대기'(push 승인과 같은 블러플)
     ):
         if text.startswith(head):
             return col

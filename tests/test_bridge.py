@@ -26,12 +26,10 @@ from adapter import (
     parse_callback,
 )
 from bridge import (
-    build_compare_prompt,
     choice_buttons,
     due_notifications,
     due_snoozes,
     event_to_progress,
-    fetch_stock,
     format_oracle_ga_status,
     format_reply,
     handle_event,
@@ -40,10 +38,8 @@ from bridge import (
     load_project_labels,
     load_schedules,
     mask_secrets,
-    parse_caption_ticker,
     parse_choice_prompt,
     parse_message,
-    parse_stock_response,
     project_buttons,
     project_label,
     push_buttons,
@@ -51,8 +47,6 @@ from bridge import (
     resolve_target,
     run_claude,
     save_notify_state,
-    stock_url,
-    valid_ticker,
 )
 
 _ALLOWED = frozenset({777})
@@ -165,7 +159,7 @@ def _photo(
     project="trading_info",
     channel_role=None,
 ):
-    # project 기본 trading_info → handle_event 가 사진 대조(_handle_photo) 경로로 라우팅.
+    # project 기본 trading_info → 채널=프로젝트로 해석돼 그 cwd 로 일반 실행(_handle_photo).
     return Event(
         kind="photo",
         channel_id=channel_id if channel_id is not None else user_id,
@@ -2088,155 +2082,57 @@ def test_button_nb_ok_no_item_falls_back(notify_env, monkeypatch, tmp_path):
 
 
 # ===========================================================================
-# ② 사진 대조 — 순수 함수(ticker 검증·URL·응답 파싱) + fetch_stock + handle_event 사진 분기
+# ② 사진 + 지시 일반 실행 — 캡션이 있으면 어느 채널이든 이미지 경로를 주입해 실행(_handle_photo)
 # ===========================================================================
-
-
-def test_valid_ticker_accepts_common():
-    for t in ("MU", "AAPL", "NQ=F", "^KS11", "005930", "0167A0", "BRK-B"):
-        assert valid_ticker(t)
-
-
-def test_valid_ticker_rejects_ssrf_and_traversal():
-    for bad in ("../etc", "A/B", "A\\B", "a b", "MU:8000", "..", "mu", "x" * 16, ""):
-        assert not valid_ticker(bad)
-
-
-def test_parse_caption_ticker_extracts_first_valid():
-    assert parse_caption_ticker("trading_info MU 대조") == "MU"
-    assert parse_caption_ticker("mu") == "MU"
-    assert parse_caption_ticker("NQ=F 확인해줘") == "NQ=F"
-
-
-def test_parse_caption_ticker_none_when_no_ticker():
-    assert parse_caption_ticker("사진 좀 봐줘") is None
-    assert parse_caption_ticker("") is None
-
-
-def test_stock_url_fixed_host_path():
-    assert stock_url("MU") == "http://127.0.0.1:8000/api/stocks/MU"
-
-
-def test_stock_url_rejects_invalid_ticker():
-    with pytest.raises(ValueError, match="ticker"):
-        stock_url("../secret")
-    with pytest.raises(ValueError):
-        stock_url("A/B")
-
-
-def test_parse_stock_response_full():
-    payload = {
-        "change_percent": -3.1,
-        "change_amount": -4.2,
-        "session": "정규장",
-        "is_trading_day": True,
-        "current_price": 131.0,
-        "name": "마이크론",
-    }
-    out = parse_stock_response(payload)
-    assert out["change_percent"] == -3.1
-    assert out["session"] == "정규장"
-    assert out["name"] == "마이크론"
-
-
-def test_parse_stock_response_missing_fields_none():
-    out = parse_stock_response({"session": "프리마켓"})
-    assert out["change_percent"] is None
-    assert out["change_amount"] is None
-    assert out["session"] == "프리마켓"
-
-
-def test_build_compare_prompt_contains_values_and_no_commit():
-    prompt = build_compare_prompt(Path("logs/photos/x.jpg"), "MU", {"change_percent": -3.1})
-    assert "MU" in prompt
-    assert "-3.1" in prompt
-    assert "x.jpg" in prompt
-    assert "커밋은 하지" in prompt
-
-
-# --- fetch_stock: urllib monkeypatch + 공유 리다이렉트 차단 핸들러(어댑터 fetch_file 재사용) ---
-
-
-class _FakeResp:
-    def __init__(self, data=b"", headers=None):
-        self._data = data
-        self.headers = headers or {}
-
-    def read(self, n=-1):
-        return self._data if n is None or n < 0 else self._data[:n]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-def _patch_urlopen(monkeypatch, resp):
-    # fetch_stock 은 고정 호스트 urlopen 만 쓴다(리다이렉트 차단 opener 는 어댑터 fetch_file 소관).
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: resp)
 
 
 def test_noredirect_handler_blocks_3xx():
     # M-3(공유 가드): redirect_request→None → urllib 이 3xx 를 HTTPError 로 승격(추종 안 함).
+    # 이 가드는 어댑터 fetch_file 다운로드가 계속 쓴다(티커 대조 제거 후에도 유지 — 다운로드 불변).
     h = _NoRedirectHandler()
     internal = "http://169.254.169.254/latest/"
     assert h.redirect_request(None, None, 302, "Found", {}, internal) is None
 
 
-def test_fetch_stock_parses_response(monkeypatch):
-    body = b'{"change_percent": -3.1, "session": "\\uc815\\uaddc\\uc7a5", "name": "MU"}'
-    _patch_urlopen(monkeypatch, _FakeResp(body))
-    out = fetch_stock("MU")
-    assert out["change_percent"] == -3.1
-    assert out["session"] == "정규장"
-
-
-def test_fetch_stock_rejects_invalid_ticker_before_network(monkeypatch):
-    called = {"n": 0}
-
-    def boom(*_a, **_k):
-        called["n"] += 1
-        raise AssertionError("네트워크 호출되면 안 됨")
-
-    monkeypatch.setattr("urllib.request.urlopen", boom)
-    with pytest.raises(ValueError):
-        fetch_stock("../etc/passwd")
-    assert called["n"] == 0
-
-
-# --- handle_event 사진 분기 오케스트레이션 (FakeAdapter.fetch_file + fetch_stock 스파이) ---
+# --- handle_event 사진 분기 오케스트레이션 (FakeAdapter.fetch_file + run 스파이) ---
 
 
 @pytest.fixture
 def photo_env(monkeypatch):
-    """run_claude_with_progress / fetch_stock 스파이 + FakeAdapter(fetch_file 기록)."""
+    """run_claude_with_progress 스파이(task·proj·tools 기록) + FakeAdapter(fetch_file 기록)."""
     fa = FakeAdapter(secrets=[])
+    bridge.channel_sessions.clear()  # _run_with_session 세션 누수 차단(테스트 격리)
+    bridge.chat_selection.clear()
 
     def fake_run(*args, **_k):
         # (adapter, channel_id, header, exe, proj, task, timeout, allowed_tools?)
-        fa.runs.append({"allowed_tools": args[7] if len(args) > 7 else None})
-        return {"result": "✅ 일치", "is_error": False}
+        fa.runs.append(
+            {
+                "proj": args[4],
+                "task": args[5],
+                "allowed_tools": args[7] if len(args) > 7 else None,
+            }
+        )
+        return {"result": "확인했습니다", "is_error": False}
 
     monkeypatch.setattr(bridge, "run_claude_with_progress", fake_run)
-    monkeypatch.setattr(
-        bridge, "fetch_stock", lambda _t: {"change_percent": -3.1, "session": "정규장"}
-    )
     return fa
 
 
-def test_photo_no_caption_prompts_no_run(photo_env, tmp_path):
+def test_photo_no_caption_guides_no_run(photo_env, tmp_path):
+    # 사진만(캡션 없음) → 실행·다운로드 없이 안내 1줄.
     (tmp_path / "trading_info").mkdir()
     _fire(photo_env, _photo(777, caption=None), repo_root=tmp_path, target_root=str(tmp_path))
     assert photo_env.runs == []
-    assert any("캡션" in t for _c, t, _b in photo_env.sent)
+    assert photo_env.fetched == []  # 캡션 없으면 다운로드조차 안 함
+    assert any("지시를 적어" in t for _c, t, _b in photo_env.sent)
 
 
 def test_photo_no_photo_ref_prompts_no_run(photo_env, tmp_path):
     (tmp_path / "trading_info").mkdir()
     _fire(
         photo_env,
-        _photo(777, caption="MU", photo_ref=None),
+        _photo(777, caption="이거 봐줘", photo_ref=None),
         repo_root=tmp_path,
         target_root=str(tmp_path),
     )
@@ -2246,38 +2142,70 @@ def test_photo_no_photo_ref_prompts_no_run(photo_env, tmp_path):
 
 def test_photo_download_fail_graceful(monkeypatch, tmp_path):
     (tmp_path / "trading_info").mkdir()
+    bridge.channel_sessions.clear()
     fa = FakeAdapter(secrets=[], fetch=OSError("net down"))
     monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: fa.runs.append(1))
-    monkeypatch.setattr(bridge, "fetch_stock", lambda _t: {})
-    _fire(fa, _photo(777, caption="MU"), repo_root=tmp_path, target_root=str(tmp_path))
+    _fire(fa, _photo(777, caption="이거 봐줘"), repo_root=tmp_path, target_root=str(tmp_path))
     assert fa.runs == []
     assert any("내려받지" in t for _c, t, _b in fa.sent)
 
 
-def test_photo_rest_fail_graceful(photo_env, monkeypatch, tmp_path):
-    (tmp_path / "trading_info").mkdir()
-
-    def boom(_t):
-        raise OSError("conn refused")
-
-    monkeypatch.setattr(bridge, "fetch_stock", boom)
-    _fire(photo_env, _photo(777, caption="MU"), repo_root=tmp_path, target_root=str(tmp_path))
-    assert photo_env.runs == []
-    assert any("REST 응답 없음" in t for _c, t, _b in photo_env.sent)
-
-
-def test_photo_normal_runs_with_read_only_tools(photo_env, tmp_path):
-    # M-1 회귀 잠금: 사진 대조 run 은 반드시 Read 전용 도구셋으로 호출.
+def test_photo_with_caption_runs_general_full_tools(photo_env, tmp_path):
+    # 사진+지시 → 이미지 다운로드 후 경로를 프롬프트에 주입해 full 화이트리스트로 일반 실행.
     (tmp_path / "trading_info").mkdir()
     _fire(
         photo_env,
-        _photo(777, caption="trading_info MU 대조"),
+        _photo(777, caption="MU 캡처 우리 값과 대조해줘"),
         repo_root=tmp_path,
         target_root=str(tmp_path),
     )
     assert len(photo_env.runs) == 1
-    assert photo_env.runs[0]["allowed_tools"] == ["Read"]
-    assert photo_env.fetched  # 사진 다운로드 시도됨
+    run = photo_env.runs[0]
+    assert run["allowed_tools"] is None  # full 화이트리스트(Read 포함) — Read 전용 대조경로 제거
+    assert "MU 캡처 우리 값과 대조해줘" in run["task"]  # 캡션이 지시로 주입
+    assert "x.jpg" in run["task"]  # 다운로드 경로가 프롬프트에 주입됨(claude 가 Read 로 판독)
+    assert Path(run["proj"]).name == "trading_info"  # 채널=프로젝트 cwd
+    assert photo_env.fetched  # 사진 다운로드됨
+
+
+def test_photo_deletes_temp_file_after_run(monkeypatch, tmp_path):
+    # L-1: 실행 후 임시파일은 성공·실패 무관 삭제(무한 누증 방지).
+    (tmp_path / "trading_info").mkdir()
+    bridge.channel_sessions.clear()
+    img = tmp_path / "shot.jpg"
+    img.write_bytes(b"x")
+    fa = FakeAdapter(secrets=[], fetch=lambda _ref, _dest: img)
+    monkeypatch.setattr(
+        bridge, "run_claude_with_progress", lambda *_a, **_k: {"result": "ok", "is_error": False}
+    )
+    _fire(fa, _photo(777, caption="이거 봐줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert not img.exists()  # 임시파일 삭제됨
+
+
+def test_photo_general_role_runs_at_root(photo_env, tmp_path):
+    # #간단처리(project None·role 간단처리) 사진+지시 → 프로젝트 무관 실행(cwd=루트) + 이미지.
+    _fire(
+        photo_env,
+        _photo(777, caption="이 값 좀 봐줘", project=None, channel_role="간단처리"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert len(photo_env.runs) == 1
+    assert photo_env.runs[0]["proj"] == str(tmp_path)  # cwd=루트(프로젝트 무관)
+    assert photo_env.fetched  # 이미지 다운로드됨(무시하지 않음)
+
+
+def test_photo_no_project_no_selection_guides(photo_env, tmp_path):
+    # 프로젝트 채널도 특수 채널도 아니고 선택도 없음 → 실행·다운로드 없이 프로젝트 선택 안내.
+    _fire(
+        photo_env,
+        _photo(777, caption="이거 봐줘", project=None, channel_role=None),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert photo_env.runs == []
+    assert photo_env.fetched == []
+    assert any("프로젝트를 선택" in t for _c, t, _b in photo_env.sent)
 
 
 def test_photo_disallowed_user_never_downloads(tmp_path):
@@ -2285,52 +2213,13 @@ def test_photo_disallowed_user_never_downloads(tmp_path):
     fa = FakeAdapter(secrets=[])
     _fire(
         fa,
-        _photo(999, caption="MU"),
+        _photo(999, caption="이거 봐줘"),
         allowed=frozenset({777}),
         repo_root=tmp_path,
         target_root=str(tmp_path),
     )
     assert fa.fetched == []
     assert fa.sent == []
-
-
-def test_photo_allowed_user_triggers_handler(photo_env, tmp_path):
-    # 허용 user 사진(캡션 없음) → 핸들러 진입해 "캡션" 안내.
-    _fire(
-        photo_env,
-        _photo(777, caption=None),
-        allowed=frozenset({777}),
-        repo_root=tmp_path,
-        target_root=str(tmp_path),
-    )
-    assert any("캡션" in t for _c, t, _b in photo_env.sent)
-
-
-def test_photo_non_trading_with_caption_routes_to_text(photo_env, tmp_path):
-    # #간단처리(project None·role 간단처리)에 사진+캡션 → 사진 무시, 캡션을 일반 지시로 실행.
-    # 주식 대조 문구("종목"·"캡션") 안 뜨고, 캡션이 run_claude_with_progress 로 실행돼야 한다.
-    _fire(
-        photo_env,
-        _photo(777, caption="이 값 좀 봐줘", project=None, channel_role="간단처리"),
-        repo_root=tmp_path,
-        target_root=str(tmp_path),
-    )
-    assert len(photo_env.runs) == 1  # 캡션이 일반 지시로 실행됨(_handle_text 경로)
-    assert photo_env.fetched == []  # 사진은 다운로드조차 안 함
-    assert not any("종목" in t or "캡션" in t for _c, t, _b in photo_env.sent)
-
-
-def test_photo_non_trading_without_caption_guides(photo_env, tmp_path):
-    # 비-trading 채널 사진 + 캡션 없음 → 실행 없이 안내 1줄.
-    _fire(
-        photo_env,
-        _photo(777, caption=None, project=None, channel_role="간단처리"),
-        repo_root=tmp_path,
-        target_root=str(tmp_path),
-    )
-    assert photo_env.runs == []
-    assert photo_env.fetched == []
-    assert any("주식모니터링 채널에서만" in t for _c, t, _b in photo_env.sent)
 
 
 # ---------------------------------------------------------------------------
@@ -2713,7 +2602,16 @@ def test_rcwp_full_path_renders_and_hides_marker(monkeypatch):
     )
     fa = FakeAdapter(secrets=[], send_ids=[10, 11])
     bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
-    assert fa.edited and all("❓선택" not in t for _c, _m, t, _b in fa.edited)
+    # 진행 메시지(10)는 '완료' 대신 질문형 헤더로 교체(완료 억제), 내부 마커(❓선택:)는 미노출.
+    prog = next(t for _c, m, t, _b in fa.edited if m == 10)
+    assert prog == bridge.HEADER_CHOICE
+    assert bridge.HEADER_DONE not in prog
+    assert all("❓선택:" not in t for _c, _m, t, _b in fa.edited)  # 내부 마커·값 미노출
+    # 질문 본문 + 버튼이 한(두 번째) 메시지에 합쳐진다 — 버튼 메시지 텍스트 = 질문, 버튼 부착.
+    _c, _m, btn_text, btn_kb = next((c, m, t, b) for c, m, t, b in fa.edited if m == 11)
+    assert btn_text == "고르세요"
+    assert btn_kb == choice_buttons(11, [("유지", "keep"), ("교체", "swap")])
+    assert all("택일" not in t for _c, _m, t, _b in fa.edited)  # 별도 '택일 하세요' 메시지 제거
     assert 11 in bridge.pending  # 버튼 메시지(두 번째 id)에 보류맵 등록
     assert bridge.pending[11]["chat_id"] == 777
     bridge.pending.clear()
@@ -2746,6 +2644,27 @@ def test_rcwp_no_choice_no_flag(monkeypatch):
     fa = FakeAdapter(secrets=[], send_ids=[10])
     data = bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
     assert not data.get("choice_rendered")
+    bridge.pending.clear()
+
+
+def test_rcwp_error_with_marker_not_hidden_as_choice(monkeypatch):
+    # is_error 인 result 에 우연히 ❓선택: 마커가 섞여도 선택으로 오인해 실패를 은닉하지 않는다.
+    bridge.pending.clear()
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {
+            "result": "고르세요\n❓선택: [유지|keep]|[교체|swap]",
+            "is_error": True,
+            "session_id": "sid-1",
+        },
+    )
+    fa = FakeAdapter(secrets=[], send_ids=[10])
+    data = bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
+    assert not data.get("choice_rendered")
+    assert bridge.pending == {}  # 버튼 미렌더
+    prog = next(t for _c, m, t, _b in fa.edited if m == 10)
+    assert prog.startswith(bridge.HEADER_FAIL)  # 실패 헤더 유지(은닉 방지)
     bridge.pending.clear()
 
 

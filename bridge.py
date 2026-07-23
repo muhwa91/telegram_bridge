@@ -397,8 +397,12 @@ def project_buttons(names: list[str]) -> list[Button]:
 
 
 def notify_buttons(item_id: str) -> list[Button]:
-    """[✅ 확인시작][⏰ 나중에] — 예약 알림."""
-    return [Button("✅ 확인시작", "nb:ok", item_id), Button("⏰ 나중에", "nb:later", item_id)]
+    """[✅ 확인시작][🎓 졸업][⏰ 나중에] — 예약 알림. 졸업=이 알림을 notify.json 에서 영구 제거."""
+    return [
+        Button("✅ 확인시작", "nb:ok", item_id),
+        Button("🎓 졸업", "nb:done", item_id),
+        Button("⏰ 나중에", "nb:later", item_id),
+    ]
 
 
 def choice_buttons(msg_id: int, choices: list[tuple[str, str]]) -> list[Button]:
@@ -422,6 +426,33 @@ def load_schedules(path: Path) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
     return [it for it in items if isinstance(it, dict) and _valid_id(it.get("id"))]
+
+
+def graduate_notify(path: Path, item_id: str) -> tuple[int, int]:
+    """notify.json 에서 id 매칭 항목을 영구 제거(졸업)하고 (제거전 총건, 제거후 총건)을 반환.
+
+    호출측은 경로로 고정 SCHEDULES_FILE 만 넘긴다(임의 경로 금지). items 리스트에서 id 가 같은
+    항목만 필터 제거하고 다른 최상위 키(timezone 등)·나머지 항목의 필드는 그대로 보존한다
+    (id 매칭 제거만 — 임의 필드 편집 금지). 저장은 원자적(tmp write→replace 준용).
+    파일 없음·손상·items 부재는 (0, 0)(제거할 것 없음 — 로더와 같은 방어적 태도). id 미존재는
+    before==after 로 신호(파일 미변경). 2-space indent 로 사람이 편집하는 서식을 유지한다.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return (0, 0)
+    items = raw.get("items") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return (0, 0)
+    before = len(items)
+    kept = [it for it in items if not (isinstance(it, dict) and it.get("id") == item_id)]
+    after = len(kept)
+    if after != before:
+        raw["items"] = kept
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    return (before, after)
 
 
 def due_notifications(
@@ -691,9 +722,14 @@ def save_channel_sessions(path: Path, sessions: dict[int, str]) -> None:
 
 def dispatch_notifications(
     adapter: Adapter,
-    items: list[dict[str, Any]],
+    items: list[dict[str, Any]] | None = None,
 ) -> None:
     """주기 틱(≤NOTIFY_TICK_SEC) 호출 — 발송할 알림이 있으면 #알림 채널로 발송한다.
+
+    items=None(운영 기본)이면 매 틱 load_schedules(SCHEDULES_FILE)로 파일을 다시 읽는다 —
+    졸업(nb:done)으로 notify.json 이 바뀌면 봇 재기동 없이 다음 틱에 즉시 반영된다(핫리로드).
+    notify.json 은 작아 매 틱 읽기 부하는 무시 가능. items 인자는 테스트가 스케줄을 직접 주입하는
+    seam(파일 I/O 없이 due/스누즈 로직 검증). ponytail: 캐시·파일감시 불필요 — 매 틱 재읽기가 최단.
 
     스케줄 due + 스누즈 due 를 합쳐 발송하고 notify_fired 에 (id, 날짜)를 기록,
     스누즈는 1회 발송 후 해제한다. 날짜가 바뀌면 지난 fired 를 정리한다. 상태 조회·변이는
@@ -702,6 +738,8 @@ def dispatch_notifications(
     발송 타겟(§4.4): #알림 채널(role_channel("알림"))로 send — 채널 1곳에 1회. 채널 매핑이
     없으면(자동생성 실패) 발송을 스킵한다(디스코드는 채널로만 발송 — 유저별 팬아웃 없음).
     """
+    if items is None:
+        items = load_schedules(SCHEDULES_FILE)
     now = datetime.now(_KST)
     today = now.date().isoformat()
     with _notify_lock:
@@ -1185,7 +1223,11 @@ HELP_TEXT = (
     "음성채널에 들어가 배경음악을 재생합니다. 정지 ㅁ정지 · 다음곡 ㅁ다음.\n"
     "\n"
     "### 오라클 상태 — 오라클\n"
-    "무료 서버(오라클 클라우드) 재고 잡이가 도는 중인지 현재 상태를 알려줍니다."
+    "무료 서버(오라클 클라우드) 재고 잡이가 도는 중인지 현재 상태를 알려줍니다.\n"
+    "\n"
+    "### 예약 알림 졸업 — 알림 카드의 🎓 졸업 버튼\n"
+    "매주 반복되던 그 검증 알림을 목록에서 영구히 뺍니다(재기동 없이 즉시). "
+    "되돌리려면 git 으로 복구 후 ㅁ푸시해줘."
 )
 
 
@@ -1688,6 +1730,29 @@ def _handle_button(
             adapter.edit(channel_id, message_id, later)
         else:
             adapter.send(channel_id, later)
+    elif action == "nb:done":
+        # 졸업 = 이 예약 알림을 notify.json 에서 영구 제거(매주 반복 발화 중단). 브리지가 직접
+        # SCHEDULES_FILE(고정 경로)의 items 에서 id 매칭 항목만 제거·원자 저장(claude 무관). 재확인
+        # 게이트 없음(수동 클릭·git 복구 가능 — 과설계 회피) — 회신에 되돌리는 법을 넣는다.
+        log.info("chat=%s callback nb:done id=%s", channel_id, arg)
+        item = next((it for it in load_schedules(SCHEDULES_FILE) if it.get("id") == arg), None)
+        label = str(item.get("label", arg)) if item else arg
+        with _notify_lock:
+            # 졸업 항목이 스누즈 대기 중이면 함께 정리(사라진 항목의 스테일 재발송 방지).
+            if notify_snooze.pop(arg, None) is not None:
+                save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
+        before, after = graduate_notify(SCHEDULES_FILE, arg)
+        if before == after:
+            done = f"「{label}」 알림이 이미 없습니다."
+        else:
+            done = (
+                f"🎓 「{label}」 알림을 뺐습니다 ({before}→{after}건). "
+                "되돌리려면 git 으로 notify.json 복구. 원격 반영은 ㅁ푸시해줘"
+            )
+        if isinstance(message_id, int):
+            adapter.edit(channel_id, message_id, done)
+        else:
+            adapter.send(channel_id, done)
     elif action == "c":
         # ③ 선택지 탭 — arg="<msg_id>:<idx|other>". 보류맵에서 세션·프로젝트를 찾아 resume 재실행.
         # M-1: channel_id + user_id 소유 항목만 조회(공유 채널 다중 유저·타 chat 세션 탈취 차단).
@@ -2081,13 +2146,16 @@ def _notify_restart_done(adapter: Adapter, channel_id: int) -> None:
 
 def _dispatch_loop(
     adapter: Adapter,
-    schedules: list[dict[str, Any]],
     stop: threading.Event,
 ) -> None:
-    """알림 스케줄 주기 틱(§3.3) — poll 카데언스와 독립된 타이머 스레드. stop 시 즉시 종료."""
+    """알림 스케줄 주기 틱(§3.3) — poll 카데언스와 독립된 타이머 스레드. stop 시 즉시 종료.
+
+    스케줄을 인자로 캐시하지 않는다 — dispatch_notifications 가 매 틱 notify.json 을 다시 읽어
+    졸업(nb:done)·수동 편집이 재기동 없이 반영된다(핫리로드).
+    """
     while not stop.wait(NOTIFY_TICK_SEC):
         try:
-            dispatch_notifications(adapter, schedules)
+            dispatch_notifications(adapter)
         except Exception as e:  # 알림 발송 오류로 스레드가 죽지 않게(타입만 기록)
             log.error("알림 발송 중 예외: %s", type(e).__name__)
 
@@ -2173,7 +2241,7 @@ def main() -> int:
     stop = threading.Event()
     disp = threading.Thread(
         target=_dispatch_loop,
-        args=(adapter, schedules, stop),
+        args=(adapter, stop),
         name="dispatch",
         daemon=True,
     )
@@ -2245,6 +2313,7 @@ def _selftest() -> None:
     assert _pb[0].action == "p" and _pb[0].arg == "a"
     assert _pb[0].style == "primary" and _pb[0].label.startswith("📁")  # 다크 대비·시각 앵커
     assert notify_buttons("y")[0] == Button("✅ 확인시작", "nb:ok", "y")
+    assert notify_buttons("y")[1] == Button("🎓 졸업", "nb:done", "y")  # 졸업=영구 제거
     _cb = choice_buttons(55, [("유지", "keep")])
     assert _cb[0].action == "c" and _cb[0].arg == "55:0" and _cb[-1].arg == "55:other"
     # 시각 알림 due 판정(순수) — 창 안 발송·dedup.

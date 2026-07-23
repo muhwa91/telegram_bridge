@@ -32,6 +32,7 @@ from bridge import (
     event_to_progress,
     format_oracle_ga_status,
     format_reply,
+    graduate_notify,
     handle_event,
     is_allowed,
     load_notify_state,
@@ -935,15 +936,21 @@ def test_parse_callback_nb_later():
     assert parse_callback("nb:later:ti-rollover") == ("nb:later", "ti-rollover")
 
 
+def test_parse_callback_nb_done():
+    assert parse_callback("nb:done:ti-rollover") == ("nb:done", "ti-rollover")
+
+
 def test_parse_callback_nb_empty_id_rejected():
     assert parse_callback("nb:ok:") is None
     assert parse_callback("nb:later:") is None
+    assert parse_callback("nb:done:") is None
 
 
 def test_parse_callback_nb_unsafe_id_rejected():
     assert parse_callback("nb:ok:bad/id") is None
     assert parse_callback("nb:ok:a b") is None
     assert parse_callback("nb:ok:" + "z" * 65) is None
+    assert parse_callback("nb:done:bad/id") is None
 
 
 def test_parse_callback_choice_index():
@@ -975,6 +982,7 @@ def test_encode_callback_is_inverse_of_parse():
         "p:etf_info",
         "nb:ok:ti-open",
         "nb:later:ti-roll",
+        "nb:done:ti-grad",
         "c:55:1",
         "c:55:other",
         "r:42",
@@ -1635,6 +1643,34 @@ def test_load_schedules_non_list_items_empty(tmp_path):
     assert load_schedules(p) == []
 
 
+# ── graduate_notify: 졸업(영구 제거) — id 매칭 항목만 제거·나머지 보존·원자 저장 ──
+def test_graduate_notify_removes_only_matching_id(tmp_path):
+    p = tmp_path / "notify.json"
+    p.write_text(
+        json.dumps({"timezone": "Asia/Seoul", "items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}),
+        encoding="utf-8",
+    )
+    assert graduate_notify(p, "b") == (3, 2)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert [it["id"] for it in raw["items"]] == ["a", "c"]  # b 만 제거
+    assert raw["timezone"] == "Asia/Seoul"  # 타 최상위 키 보존
+
+
+def test_graduate_notify_missing_id_no_change(tmp_path):
+    p = tmp_path / "notify.json"
+    original = json.dumps({"items": [{"id": "a"}]})
+    p.write_text(original, encoding="utf-8")
+    assert graduate_notify(p, "nope") == (1, 1)  # before==after → 이미 없음 신호
+    assert p.read_text(encoding="utf-8") == original  # 파일 미변경
+
+
+def test_graduate_notify_missing_or_corrupt_file_graceful(tmp_path):
+    assert graduate_notify(tmp_path / "nope.json", "a") == (0, 0)
+    p = tmp_path / "bad.json"
+    p.write_text("{ not json", encoding="utf-8")
+    assert graduate_notify(p, "a") == (0, 0)
+
+
 def test_due_notifications_in_window():
     assert due_notifications([_item()], _WED_0910, set()) == [_item()]
 
@@ -2007,6 +2043,52 @@ def test_button_nb_disallowed_user_ignored(notify_env, tmp_path):
     assert notify_env.edited == []
     assert notify_env.saves == []
     assert bridge.notify_snooze == {}
+
+
+# ── nb:done(졸업): notify.json 에서 영구 제거 + 안내 회신 ──
+def test_button_nb_done_removes_item_and_reports_counts(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [_item(id="a", label="개장"), _item(id="b")])
+    _fire(notify_env, _btn(777, "nb:done", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert notify_env.edited[0][2].startswith("🎓")
+    assert "(2→1건)" in notify_env.edited[0][2] and "개장" in notify_env.edited[0][2]
+    # 파일에서 a 만 빠지고 b 는 유지.
+    remaining = [it["id"] for it in bridge.load_schedules(bridge.SCHEDULES_FILE)]
+    assert remaining == ["b"]
+
+
+def test_button_nb_done_already_gone(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [_item(id="b")])
+    _fire(notify_env, _btn(777, "nb:done", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert "이미 없습니다" in notify_env.edited[0][2]
+    assert [it["id"] for it in bridge.load_schedules(bridge.SCHEDULES_FILE)] == ["b"]  # 미변경
+
+
+def test_button_nb_done_clears_pending_snooze(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [_item(id="a")])
+    bridge.notify_snooze["a"] = "2026-07-15T09:00:00+09:00"
+    _fire(notify_env, _btn(777, "nb:done", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert "a" not in bridge.notify_snooze  # 사라진 항목의 스테일 스누즈 정리
+    assert len(notify_env.saves) == 1
+
+
+def test_button_nb_done_disallowed_user_no_file_change(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [_item(id="a")])
+    _fire(notify_env, _btn(999, "nb:done", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert notify_env.edited == []
+    assert [it["id"] for it in bridge.load_schedules(bridge.SCHEDULES_FILE)] == ["a"]  # 미변경
+
+
+def test_dispatch_hot_reloads_notify_file(notify_env, monkeypatch, tmp_path):
+    # 핫리로드: items 인자 없이 호출하면 매번 notify.json 을 다시 읽는다(졸업 즉시 반영).
+    _freeze_now(monkeypatch, _WED_0910)
+    _write_schedules(monkeypatch, tmp_path, [_item(id="a")])
+    bridge.dispatch_notifications(notify_env)  # 파일에서 로드 → due → 발송
+    assert len(notify_env.sent) == 1
+    # 졸업으로 파일에서 제거 → 다음 틱엔(다른 날 시뮬) 대상 없음. 같은 날은 fired 로 이미 억제됨.
+    _write_schedules(monkeypatch, tmp_path, [])  # a 졸업된 상태 재현
+    bridge.notify_fired.clear()
+    bridge.dispatch_notifications(notify_env)  # 빈 파일 재읽기 → 발송 없음
+    assert len(notify_env.sent) == 1  # 증가 없음(핫리로드로 a 소멸 반영)
 
 
 def test_build_notify_check_prompt_contents():

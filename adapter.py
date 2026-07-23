@@ -22,7 +22,7 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|nb:ok|nb:later + §4.7 델타3(r|rec|fav|fav:add|fav:del).
+    # 정규화 액션: push|x|p|c|nb:ok|nb:later|nb:done + §4.7 델타3(r|rec|fav|fav:add|fav:del).
     action: str
     arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
@@ -175,13 +175,13 @@ def parse_callback(data: str) -> tuple[str, str] | None:
     """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
 
     `push`/`x`/`clean:ok` → (그대로, ""), `p:<name>` → ("p", name),
-    `nb:ok:<id>`/`nb:later:<id>` → ("nb:ok"/"nb:later", id). 임의 실행 없이 정확 매칭만.
+    `nb:ok:<id>`/`nb:later:<id>`/`nb:done:<id>` → ("nb:ok"/"nb:later"/"nb:done", id). 정확 매칭만.
     """
     if data in ("push", "x", "clean:ok"):
         return (data, "")
     if data.startswith("p:") and len(data) > 2:
         return ("p", data[2:])
-    for prefix in ("nb:ok:", "nb:later:"):
+    for prefix in ("nb:ok:", "nb:later:", "nb:done:"):
         if data.startswith(prefix):
             item_id = data[len(prefix) :]
             # id 는 우리가 발행하지만 callback_data 는 신뢰 경계 밖 — 방출측과 같은 문(_valid_id).
@@ -234,7 +234,8 @@ def encode_callback(action: str, arg: str) -> str:
     if action in ("push", "x", "clean:ok"):
         return action
     # 콜론-join 액션(§1.3 + §4.7 델타3): arg(id·mid·idx·"mid:idx"·"mid:go")를 그대로 이어붙인다.
-    if action in ("p", "nb:ok", "nb:later", "c", "r", "rec", "fav", "fav:add", "fav:del"):
+    _joined = ("p", "nb:ok", "nb:later", "nb:done", "c", "r", "rec", "fav", "fav:add", "fav:del")
+    if action in _joined:
         return f"{action}:{arg}"
     return action  # 방출측이 유효 액션만 넘기므로 폴백은 그대로
 

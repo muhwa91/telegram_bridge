@@ -62,7 +62,11 @@ def test_render_view_choice_and_notify_custom_ids():
     from bridge import choice_buttons, notify_buttons
 
     v1 = render_view(notify_buttons("ti-open"))
-    assert [c.custom_id for c in v1.children] == ["nb:ok:ti-open", "nb:later:ti-open"]
+    assert [c.custom_id for c in v1.children] == [
+        "nb:ok:ti-open",
+        "nb:done:ti-open",
+        "nb:later:ti-open",
+    ]
     v2 = render_view(choice_buttons(55, [("유지", "keep"), ("교체", "swap")]))
     assert [c.custom_id for c in v2.children] == ["c:55:0", "c:55:1", "c:55:other"]
 
@@ -120,9 +124,7 @@ def test_fetch_file_sends_user_agent(monkeypatch, tmp_path):
     # 함정 회귀 방지: 디스코드 CDN(Cloudflare)은 기본 UA(Python-urllib/*)를 403 차단(2026-07-22
     # 라이브 실측). Request 에 User-Agent 가 실려야 다운로드가 된다.
     seen = []
-    _patch_urlopen(
-        monkeypatch, _FakeResp(b"x")
-    )  # 기본 패치 후 open 을 가로채 Request 캡처로 교체
+    _patch_urlopen(monkeypatch, _FakeResp(b"x"))  # 기본 패치 후 open 을 가로채 Request 캡처로 교체
     monkeypatch.setattr(
         discord_adapter._NOREDIRECT_OPENER,
         "open",
